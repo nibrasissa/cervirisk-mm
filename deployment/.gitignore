@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+*.env
+.envrc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data files — large parquets are reproducible from source, don't commit
+data/raw/*.parquet
+data/processed/*.parquet
+# Keep the directory structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model artifacts — most are regenerable so don't commit
+models/*.pkl
+models/*.json
+models/*.md
+# BUT do commit the deployed/canonical ones so Streamlit Cloud can load them
+# (they are also small enough — typical sklearn pipeline ~1-5 MB)
+!models/cervirisk_mm_v0.1.pkl
+!models/metrics.json
+!models/drift_baseline.json
+!models/tuned_params.json
+!models/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore

@@ -1,0 +1,7 @@
+# CerviRisk-MM theme — colors derived from the logo
+[theme]
+primaryColor = "#A12F77"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F6FA"
+textColor = "#0F2B4C"
+font = "sans serif"

@@ -1,0 +1,42 @@
+# docker-compose.yml — local one-command deployment of CerviRisk-MM.
+#
+# Usage:
+#     # First train a model on the host (one-time setup):
+#     python -m src.model.train --tune
+#
+#     # Then boot the API in Docker:
+#     docker compose up --build
+#
+#     # Visit:
+#     #   http://localhost:8000/        landing
+#     #   http://localhost:8000/docs    Swagger UI
+#     #   http://localhost:8000/health  liveness probe
+#
+# The ./models, ./data, and ./docs directories are mounted read-only so the
+# container picks up new artifacts without rebuilding the image.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cervirisk-mm:0.1.0
+    container_name: cervirisk-api
+    ports:
+      - "8000:8000"
+    environment:
+      CERVIRISK_HOST: "0.0.0.0"
+      CERVIRISK_PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data:ro
+      - ./docs:/app/docs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request, sys; r = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if r.status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
