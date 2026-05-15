@@ -1,14 +1,11 @@
 """CerviRisk-MM — Streamlit Community Cloud deployment.
 
-Streamlit Cloud auto-detects `streamlit_app.py` at the repo root and serves
-it as the live demo. This is a single-process version that loads the trained
-model directly with joblib — no separate FastAPI service.
+Streamlit Cloud auto-detects `app.py` (or `streamlit_app.py`) at the repo
+root and serves it as the live demo. This is a single-process version that
+loads the trained model directly with joblib — no separate FastAPI service.
 
 The full version with FastAPI + drift detection + live NCBI lives in
 frontend/app.py and is launched locally via `.\\run.ps1 ui`.
-
-Live demo URL after deployment:
-    https://YOUR-USERNAME-cervirisk-mm.streamlit.app
 """
 from __future__ import annotations
 
@@ -92,7 +89,7 @@ SAMPLE_PATIENTS = {
 
 
 # ---------------------------------------------------------------------------
-# Resource loading (cached for the lifetime of the Streamlit process)
+# Resource loading
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_model() -> tuple[object | None, Path | None]:
@@ -134,7 +131,6 @@ def tier_for(p: float) -> str:
 
 
 def compute_shap(model, df: pd.DataFrame, top_k: int = 10) -> list[dict]:
-    """Use XGBoost's built-in TreeSHAP (avoids SHAP-library version coupling)."""
     try:
         pre = model.named_steps["pre"]
         clf = model.named_steps["clf"]
@@ -411,17 +407,13 @@ with tab_predict:
         )
 
 with tab_about:
-    st.subheader("About this Space")
+    st.subheader("About this demo")
     st.markdown(
-        "This is the **live demo** of CerviRisk-MM, a multi-modal cervical "
-        "cancer risk prediction pipeline built for the Karolinska Institutet "
-        "PhD application (Center for Cervical Cancer Elimination)."
-    )
-    st.markdown(
-        "**This demo runs the deployed model only.** The full pipeline — "
-        "FastAPI service, drift detection against live NCBI feed, 53 "
-        "automated tests, Docker deployment, GitHub Actions CI — is available "
-        "in the source repository."
+        "**CerviRisk-MM** is a research prototype multi-modal cervical cancer "
+        "risk prediction pipeline. This demo runs the deployed model only — "
+        "the full pipeline (FastAPI service, drift detection against live "
+        "NCBI feed, 53 automated tests, Docker deployment, GitHub Actions CI) "
+        "is available in the source repository."
     )
 
     metrics = load_metrics()
