@@ -99,6 +99,7 @@ def load_model() -> tuple[object | None, Path | None]:
     candidates = [
         Path("models/cervirisk_mm_v0.1.pkl"),
         Path(__file__).parent / "models" / "cervirisk_mm_v0.1.pkl",
+        Path(__file__).parent.parent / "models" / "cervirisk_mm_v0.1.pkl",
     ]
     for c in candidates:
         if c.exists():
@@ -109,7 +110,8 @@ def load_model() -> tuple[object | None, Path | None]:
 @st.cache_resource
 def load_metrics() -> dict | None:
     for c in (Path("models/metrics.json"),
-              Path(__file__).parent / "models" / "metrics.json"):
+              Path(__file__).parent / "models" / "metrics.json",
+              Path(__file__).parent.parent / "models" / "metrics.json"):
         if c.exists():
             try:
                 return json.loads(c.read_text())
@@ -414,8 +416,8 @@ with tab_about:
     st.subheader("About this Space")
     st.markdown(
         "This is the **live demo** of CerviRisk-MM, a multi-modal cervical "
-        "cancer risk prediction pipeline built for the Karolinska Institutet "
-        "PhD application (Center for Cervical Cancer Elimination)."
+        "cancer risk prediction pipeline integrating clinical, genomic, and "
+        "virological features."
     )
     st.markdown(
         "**This demo runs the deployed model only.** The full pipeline — "
@@ -451,8 +453,7 @@ with tab_about:
         "biology, but per-individual genotypes are sampled from population "
         "allele frequencies, not from real VCFs.\n"
         "- **Augmentation did not improve over UCI-only features** on this "
-        "cohort — reported honestly because the architecture is the deliverable, "
-        "not the metric."
+        "cohort — reported for transparency."
     )
 
 st.divider()
