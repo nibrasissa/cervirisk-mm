@@ -1,10 +1,10 @@
 # CerviRisk-MM
 
-**Cervical cancer multi-modal risk prediction — end-to-end pipeline with continuous data ingestion.**
+**Cervical cancer multi-modal risk prediction  (end-to-end pipeline with continuous data ingestion)**
 
-Built for the Karolinska Institutet PhD application (Center for Cervical Cancer Elimination, Joakim Dillner).
 
-> **Research prototype, not a medical device.** All predictions are tagged `RESEARCH_PROTOTYPE` and accompanied by a clinical disclaimer.
+
+> **This is a research prototype, not a medically validated tool.** All predictions are tagged `RESEARCH_PROTOTYPE` and accompanied by a clinical disclaimer.
 
 ---
 
@@ -14,10 +14,10 @@ A reproducible machine learning pipeline that:
 
 1. **Ingests** four public data sources on demand (UCI clinical, NCBI HPV sequences, 1000 Genomes ancestry, PGS Catalog).
 2. **Assembles** synthetic multi-modal patient records by anchoring on real UCI outcomes and layering biologically-informed augmentations, with explicit provenance tracking.
-3. **Trains** 18 model variants (3 feature modes × 6 algorithms) under a nested evaluation protocol.
+3. **Trains** 18 model variants (3 feature configration × 6 algorithms) under a nested evaluation protocol.
 4. **Serves** the best variant through a FastAPI service with three endpoints, dockerized for one-command deployment.
 
-The exercise is graded on engineering quality, not metric peaks. The repo is designed so any reviewer can run `docker compose up` and have a working prediction endpoint in three minutes.
+The repo is designed so any reviewer can run `docker compose up` and have a working prediction endpoint in three minutes.
 
 ---
 
@@ -97,7 +97,7 @@ uvicorn src.api.main:app --reload --port 8000
 | **1000 Genomes phase-3 panel** | Ancestry-matched host individuals for PRS placeholder | 2,504 individuals across 5 super-populations (AMR=347 used for the UCI Caracas cohort) | `REAL_OBSERVED` (panel); `REAL_COMPUTED` (PRS placeholder) |
 | **PGS Catalog REST API** | Cervical-cancer-specific polygenic scoring file (best-effort) | 8 candidate scores found; canonical EFO query returned empty | Placeholder for v0.1 — see `docs/DATA_PROVENANCE.md` |
 
-The integrity contract: **biopsy outcomes are never overwritten by augmentation**. Every record carries a `data_status` tag — `REAL_OUTCOME` (from UCI), `SYNTHETIC_ASSEMBLY` (any augmented column derived from a sampled prior), or `REAL_COMPUTED` (deterministic features like strain carcinogenicity). Provenance enforcement is tested with `tests/test_ingestion_smoke.py::test_provenance_protects_biopsy_outcome`.
+The integrity contract: **biopsy outcomes are never overwritten by augmentation**. Every record carries a `data_status` tag  `REAL_OUTCOME` (from UCI), `SYNTHETIC_ASSEMBLY` (any augmented column derived from a sampled prior), or `REAL_COMPUTED` (deterministic features like strain carcinogenicity). Provenance enforcement is tested with `tests/test_ingestion_smoke.py::test_provenance_protects_biopsy_outcome`.
 
 ---
 
@@ -169,7 +169,7 @@ The wide test-set standard deviations (especially ±26.6% on AUPRC) reflect the 
 - **Augmentation does not improve over UCI alone.** Strain assignment reaches only 18 of 858 patients (2.1%) because UCI's HPV reporting is sparse, and the host PRS is a placeholder. The pipeline architecture accepts real strain genotyping from clinical sources unchanged — but on UCI, augmentation has no measurable effect.
 - **IterativeImputer does not improve over SimpleImputer (median).** Tested as a methodological alternative — DEV AUPRC differs by <1 percentage point across all six algorithms. The columns with substantial NaN are also the least predictive ones, so no imputer can extract signal that isn't there.
 
-These negative findings are themselves engineering deliverables — they show that the pipeline can test alternatives honestly.
+These negative findings are documented for transparency.
 
 ---
 
@@ -265,25 +265,21 @@ All 20 pass on a clean checkout after `python -m src.model.train`.
 
 ---
 
-## What's deferred to days 4–14
+## Roadmap
 
-This repo is days 1–3 of a 14-day exercise. Roadmap for what comes next:
-
-- **Day 4** — Real cervical-cancer PGS from a working PGS Catalog endpoint (or a manually-computed score from Pujol Gualdo et al. 2023 GWAS summary statistics)
-- **Days 5–6** — Drift detection module (`src/drift/`): PSI and KS tests on incoming HPV strain distributions vs published priors; retrain trigger
-- **Day 7** — Live PaVE strain typing for unspecified NCBI records
-- **Day 8** — SHAP explanations in `/predict/cervical-risk` response
-- **Days 9–10** — GitHub Actions CI/CD: lint + tests + build on push; build container to GHCR on release
-- **Days 11–12** — Biological drift demonstration: simulate post-vaccination strain replacement, show the drift detector triggering and the model adapting
-- **Days 13–14** — Final report polish + interview prep
+- Real cervical-cancer PGS from a working PGS Catalog endpoint (or a manually-computed score from Pujol Gualdo et al. 2023 GWAS summary statistics)
+- Drift detection module (`src/drift/`): PSI and KS tests on incoming HPV strain distributions vs published priors; retrain trigger
+- Live PaVE strain typing for unspecified NCBI records
+- SHAP explanations in `/predict/cervical-risk` response
+- GitHub Actions CI/CD: lint + tests + build on push; build container to GHCR on release
+- Biological drift demonstration: simulate post-vaccination strain replacement, show the drift detector triggering and the model adapting
+- Final report polish
 
 ---
 
 ## Limitations
 
-Documented honestly because reviewers ask:
-
-1. **n=858 is small.** No model on this cohort will reach the AUROC of cervical risk models trained on tens of thousands of patients (e.g., the Karolinska HPV Reference Center registries). Reported metrics are reasonable for the dataset size, not state of the art.
+1. **n=858 is small.** No model on this cohort will reach the AUROC of cervical risk models trained on tens of thousands of patients. Reported metrics are reasonable for the dataset size, not state of the art.
 2. **The augmented mode adds infrastructure, not predictive lift.** Strain assignment reaches only 18 patients in UCI. The value is the *architecture* (which accepts real strain genotyping unchanged), not the metrics.
 3. **The triage model is not a screening tool.** It assumes the patient is already in colposcopy with intermediate test results. Two complementary clinical models are reported in this repo for clarity.
 4. **The host PRS is a placeholder.** Day 4 will integrate a real cervical-cancer scoring file.
