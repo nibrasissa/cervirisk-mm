@@ -1,11 +1,10 @@
 """CerviRisk-MM — Streamlit Community Cloud deployment.
 
-Streamlit Cloud auto-detects `app.py` (or `streamlit_app.py`) at the repo
-root and serves it as the live demo. This is a single-process version that
-loads the trained model directly with joblib — no separate FastAPI service.
+Self-contained: loads the trained model directly with joblib. No FastAPI
+process needed alongside. The full version with live NCBI drift monitoring
+lives in frontend/app.py and is launched locally via `.\\run.ps1 ui`.
 
-The full version with FastAPI + drift detection + live NCBI lives in
-frontend/app.py and is launched locally via `.\\run.ps1 ui`.
+Live: https://cervirisk-mm.streamlit.app/
 """
 from __future__ import annotations
 
@@ -44,6 +43,23 @@ DISCLAIMER = (
     "used for clinical diagnosis or treatment decisions without appropriate "
     "regulatory approval and clinical validation."
 )
+
+# Deployed model metrics — these are part of the frozen v0.1 artifact,
+# hardcoded for reliable display (the JSON format may differ from training run
+# to training run; the cloud demo serves a fixed model with fixed numbers).
+DEPLOYED_METRICS = {
+    "variant": "triage + xgb (tuned)",
+    "dev": {
+        "auprc": 65.2, "auroc": 96.7,
+        "sensitivity": 93.2, "specificity": 95.3,
+        "n": 686, "positives": 44,
+    },
+    "test": {
+        "auprc": (76.7, 26.6), "auroc": (95.4, 7.1),
+        "sensitivity": (80.0, 40.0), "specificity": (96.3, 2.3),
+        "n": 172, "positives": 11,
+    },
+}
 
 ALL_FEATURES = [
     "Age", "Number of sexual partners", "First sexual intercourse",
@@ -93,20 +109,17 @@ SAMPLE_PATIENTS = {
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_model() -> tuple[object | None, Path | None]:
-    candidates = [
-        Path("models/cervirisk_mm_v0.1.pkl"),
-        Path(__file__).parent / "models" / "cervirisk_mm_v0.1.pkl",
-    ]
-    for c in candidates:
+    for c in (Path("models/cervirisk_mm_v0.1.pkl"),
+              Path(__file__).parent / "models" / "cervirisk_mm_v0.1.pkl"):
         if c.exists():
             return joblib.load(c), c
     return None, None
 
 
 @st.cache_resource
-def load_metrics() -> dict | None:
-    for c in (Path("models/metrics.json"),
-              Path(__file__).parent / "models" / "metrics.json"):
+def load_baseline() -> dict | None:
+    for c in (Path("models/drift_baseline.json"),
+              Path(__file__).parent / "models" / "drift_baseline.json"):
         if c.exists():
             try:
                 return json.loads(c.read_text())
@@ -123,10 +136,8 @@ def features_to_row(patient: dict) -> pd.DataFrame:
 
 
 def tier_for(p: float) -> str:
-    if p < 0.20:
-        return "low"
-    if p < 0.50:
-        return "moderate"
+    if p < 0.20: return "low"
+    if p < 0.50: return "moderate"
     return "high"
 
 
@@ -159,8 +170,7 @@ def compute_shap(model, df: pd.DataFrame, top_k: int = 10) -> list[dict]:
                     name = f"{base}: {value}"
                     break
             ranked.append({
-                "name": name,
-                "value": float(val),
+                "name": name, "value": float(val),
                 "contribution": float(contrib),
                 "direction": "up" if contrib > 0 else "down",
             })
@@ -303,8 +313,13 @@ st.caption(
     "not a medical device"
 )
 
-tab_predict, tab_about = st.tabs(["Predict", "About this model"])
+tab_predict, tab_drift, tab_about = st.tabs(
+    ["Predict", "Drift detection", "About this model"]
+)
 
+# ============================================================================
+# Tab 1: PREDICT
+# ============================================================================
 with tab_predict:
     if st.button("Run prediction", type="primary", use_container_width=True):
         df = features_to_row(patient)
@@ -406,31 +421,113 @@ with tab_predict:
             "Three sample profiles are available; you can also build a custom patient."
         )
 
+
+# ============================================================================
+# Tab 2: DRIFT DETECTION
+# ============================================================================
+with tab_drift:
+    st.subheader("Drift detection — overview")
+    st.markdown(
+        "CerviRisk-MM watches its own input distributions with three "
+        "statistical tests. The full version (Docker / local clone) pulls "
+        "live NCBI deposits and refreshes every minute. **This cloud demo "
+        "shows a static demonstration** of how the detector responds to a "
+        "calibrated post-vaccination scenario."
+    )
+
+    st.subheader("Statistical tests")
+    drift_methods = pd.DataFrame([
+        {"Method": "PSI",
+         "Detects":   "Categorical shift (strain composition, ancestry)",
+         "Threshold": "< 0.10 none · 0.10–0.20 minor · ≥ 0.20 significant"},
+        {"Method": "KS 2-sample",
+         "Detects":   "Continuous shift (age, PRS, smoking years)",
+         "Threshold": "D ≥ 0.10 OR p < 0.05"},
+        {"Method": "Chi-square",
+         "Detects":   "Observed counts vs published prior",
+         "Threshold": "p < 0.05"},
+    ])
+    st.dataframe(drift_methods, use_container_width=True, hide_index=True)
+
+    st.subheader("Forward-time vaccination simulation")
+    st.caption(
+        "Calibrated to Drolet et al. *Lancet* 2019 — pooled meta-analysis of "
+        "65 studies and 60 million person-years. HPV16 down 80%, HPV18 down "
+        "83%, HPV31/33/45 cross-protection 55–65%, plateau at year 13."
+    )
+    drift_sim = pd.DataFrame([
+        {"Time": "Baseline", "HPV16 share": "55.0%", "PSI": 0.000,
+         "Severity": "none",        "Recommended": "—"},
+        {"Time": "Year 5",   "HPV16 share": "50.7%", "PSI": 0.020,
+         "Severity": "none",        "Recommended": "no action"},
+        {"Time": "Year 10",  "HPV16 share": "42.1%", "PSI": 0.156,
+         "Severity": "minor",       "Recommended": "monitor"},
+        {"Time": "Year 15",  "HPV16 share": "35.9%", "PSI": 0.330,
+         "Severity": "significant", "Recommended": "RETRAIN"},
+        {"Time": "Year 20",  "HPV16 share": "31.2%", "PSI": 0.495,
+         "Severity": "significant", "Recommended": "RETRAIN"},
+    ])
+    st.dataframe(drift_sim, use_container_width=True, hide_index=True)
+
+    st.markdown(
+        "The detector stays **silent during natural variation** (years 0–5), "
+        "raises a **graduated warning** as drift accumulates (year 10 → "
+        "minor), and crosses the **retrain threshold** at the realistic "
+        "15–20 year horizon predicted by the Drolet meta-analysis."
+    )
+
+    st.subheader("Real-world finding")
+    st.info(
+        "When the same detector is applied to **live NCBI HPV deposits vs "
+        "the de Sanjosé 2010 published prevalence prior**, it returns "
+        "**PSI = 1.68** — significant drift. This is not a population "
+        "shift; it is **research-deposition bias** (HPV16 is over-"
+        "represented in NCBI sequencing studies). The detector correctly "
+        "surfaces it as a data-quality signal."
+    )
+
+    baseline = load_baseline()
+    if baseline:
+        with st.expander("Saved drift baseline (training-time statistics)"):
+            st.json(baseline)
+
+
+# ============================================================================
+# Tab 3: ABOUT
+# ============================================================================
 with tab_about:
     st.subheader("About this demo")
     st.markdown(
-        "**CerviRisk-MM** is a research prototype multi-modal cervical cancer "
-        "risk prediction pipeline. This demo runs the deployed model only — "
-        "the full pipeline (FastAPI service, drift detection against live "
-        "NCBI feed, 53 automated tests, Docker deployment, GitHub Actions CI) "
-        "is available in the source repository."
+        "**CerviRisk-MM** is a research prototype multi-modal cervical "
+        "cancer risk prediction pipeline. This demo runs the deployed model "
+        "only — the full pipeline (FastAPI service, drift detection against "
+        "live NCBI feed, 53 automated tests, Docker deployment, GitHub "
+        "Actions CI) is available in the source repository."
     )
 
-    metrics = load_metrics()
-    if metrics:
-        st.subheader("Deployed model — performance")
-        try:
-            best = max(metrics, key=lambda r: ((r.get("dev") or {})
-                        .get("youden", {}).get("auprc", 0)
-                        if isinstance(r.get("dev"), dict) else 0))
-            cols = st.columns(4)
-            cols[0].metric("DEV AUPRC", f"{best.get('dev_auprc_pct', '—')}%")
-            cols[1].metric("DEV AUROC", f"{best.get('dev_auroc_pct', '—')}%")
-            cols[2].metric("Sensitivity", f"{best.get('dev_sensitivity_pct', '—')}%")
-            cols[3].metric("Specificity", f"{best.get('dev_specificity_pct', '—')}%")
-            st.caption(f"Variant: `{best.get('mode')} + {best.get('model')}`")
-        except Exception:
-            pass
+    st.subheader("Deployed model — performance")
+    st.caption(f"Variant: `{DEPLOYED_METRICS['variant']}`")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("DEV AUPRC",   f"{DEPLOYED_METRICS['dev']['auprc']}%")
+    c2.metric("DEV AUROC",   f"{DEPLOYED_METRICS['dev']['auroc']}%")
+    c3.metric("Sensitivity", f"{DEPLOYED_METRICS['dev']['sensitivity']}%")
+    c4.metric("Specificity", f"{DEPLOYED_METRICS['dev']['specificity']}%")
+    st.caption(
+        f"Evaluated by leave-one-out cross-validation on "
+        f"{DEPLOYED_METRICS['dev']['n']} development patients "
+        f"({DEPLOYED_METRICS['dev']['positives']} biopsy-positive)."
+    )
+
+    with st.expander("Held-out TEST set (5-fold stratified subsampling)"):
+        test = DEPLOYED_METRICS["test"]
+        st.markdown(
+            f"- **AUPRC** {test['auprc'][0]}% ± {test['auprc'][1]}%\n"
+            f"- **AUROC** {test['auroc'][0]}% ± {test['auroc'][1]}%\n"
+            f"- **Sensitivity** {test['sensitivity'][0]}% ± {test['sensitivity'][1]}%\n"
+            f"- **Specificity** {test['specificity'][0]}% ± {test['specificity'][1]}%\n\n"
+            f"n = {test['n']} held-out patients · {test['positives']} biopsy-positive · "
+            f"wide standard deviations reflect ~2 positives per 5-fold chunk."
+        )
 
     st.subheader("Honest limitations")
     st.markdown(
@@ -446,6 +543,10 @@ with tab_about:
         "cohort — reported honestly because the architecture is the deliverable, "
         "not the metric."
     )
+
+    st.subheader("Source")
+    st.markdown("- **GitHub:** https://github.com/nibrasissa/cervirisk-mm")
+    st.markdown("- **License:** MIT")
 
 st.divider()
 st.caption(
