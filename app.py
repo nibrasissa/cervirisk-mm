@@ -1,52 +1,65 @@
-"""CerviRisk-MM Streamlit frontend.
+"""CerviRisk-MM — Streamlit Community Cloud deployment.
 
-A clinical-style UI for the CerviRisk-MM API. Runs as a separate process
-and calls the existing FastAPI endpoints over HTTP. The frontend adds no
-backend behavior — it only renders what the API returns.
+Streamlit Cloud auto-detects `streamlit_app.py` at the repo root and serves
+it as the live demo. This is a single-process version that loads the trained
+model directly with joblib — no separate FastAPI service.
 
-Architecture:
-    Browser  →  Streamlit (port 8501)  →  FastAPI (port 8000)  →  Model
+The full version with FastAPI + drift detection + live NCBI lives in
+frontend/app.py and is launched locally via `.\\run.ps1 ui`.
 
-Run with:
-    streamlit run frontend/app.py
-or:
-    .\\run.ps1 ui
+Live demo URL after deployment:
+    https://YOUR-USERNAME-cervirisk-mm.streamlit.app
 """
 from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 
+import joblib
 import pandas as pd
-import requests
 import streamlit as st
 
-
 # ---------------------------------------------------------------------------
-# Configuration
+# Page setup + brand palette
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="CerviRisk-MM",
-    page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_API_URL = "http://localhost:8000"
+BRAND_NAVY        = "#0F2B4C"
+BRAND_NAVY_BAR    = "#3B7CC9"
+BRAND_MAGENTA     = "#A12F77"
+BRAND_MAGENTA_BAR = "#D04A9A"
+BRAND_AMBER       = "#D97706"
+BRAND_MUTED       = "#6B7280"
 
 TIER_COLORS = {
-    "low":      "#16a34a",   # green
-    "moderate": "#d97706",   # amber
-    "high":     "#dc2626",   # red
+    "low":      BRAND_NAVY,
+    "moderate": BRAND_AMBER,
+    "high":     BRAND_MAGENTA,
 }
 
-SEVERITY_COLORS = {
-    "none":        "#16a34a",
-    "minor":       "#d97706",
-    "significant": "#dc2626",
-}
+DISCLAIMER = (
+    "Research prototype — not a medical device. Predictions must not be "
+    "used for clinical diagnosis or treatment decisions without appropriate "
+    "regulatory approval and clinical validation."
+)
 
-# Three canonical sample patients
+ALL_FEATURES = [
+    "Age", "Number of sexual partners", "First sexual intercourse",
+    "Num of pregnancies", "Smokes", "Smokes (years)",
+    "Hormonal Contraceptives", "Hormonal Contraceptives (years)",
+    "IUD", "IUD (years)",
+    "STDs", "STDs (number)", "STDs:HPV", "STDs:HIV",
+    "Dx:Cancer", "Dx:CIN", "Dx:HPV",
+    "Hinselmann", "Schiller", "Citology",
+    "host_prs", "strain_carcinogenicity",
+    "assigned_hpv_strain", "matched_super_pop",
+]
+
 SAMPLE_PATIENTS = {
     "Low-risk profile": {
         "Age": 24, "Number of sexual partners": 1, "First sexual intercourse": 19,
@@ -54,7 +67,6 @@ SAMPLE_PATIENTS = {
         "Hormonal Contraceptives": 0, "IUD": 0,
         "STDs": 0, "STDs:HPV": 0, "Dx:HPV": 0,
         "Hinselmann": 0, "Schiller": 0, "Citology": 0,
-        # Multi-modal context: no HPV detected → no strain assigned, PRS at population baseline
         "host_prs": 1.05, "matched_super_pop": "AMR",
     },
     "Moderate-risk profile": {
@@ -63,7 +75,6 @@ SAMPLE_PATIENTS = {
         "Hormonal Contraceptives": 1, "Hormonal Contraceptives (years)": 6,
         "IUD": 0, "STDs": 1, "STDs:HPV": 1, "Dx:HPV": 1,
         "Hinselmann": 0, "Schiller": 1, "Citology": 0,
-        # Multi-modal context: HPV-positive → HPV16 assigned, PRS elevated
         "assigned_hpv_strain": "HPV16", "strain_carcinogenicity": 0.95,
         "host_prs": 1.42, "matched_super_pop": "AMR",
     },
@@ -74,7 +85,6 @@ SAMPLE_PATIENTS = {
         "IUD": 1, "IUD (years)": 5,
         "STDs": 1, "STDs (number)": 2, "STDs:HPV": 1, "Dx:HPV": 1, "Dx:CIN": 1,
         "Hinselmann": 1, "Schiller": 1, "Citology": 1,
-        # Multi-modal context: confirmed HPV16, high PRS
         "assigned_hpv_strain": "HPV16", "strain_carcinogenicity": 0.95,
         "host_prs": 1.65, "matched_super_pop": "AMR",
     },
@@ -82,288 +92,97 @@ SAMPLE_PATIENTS = {
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Resource loading (cached for the lifetime of the Streamlit process)
 # ---------------------------------------------------------------------------
-def api_get(url: str, path: str, timeout: int = 5) -> tuple[bool, dict | None, str | None]:
-    """GET request returning (ok, body, error_message)."""
+@st.cache_resource
+def load_model() -> tuple[object | None, Path | None]:
+    candidates = [
+        Path("models/cervirisk_mm_v0.1.pkl"),
+        Path(__file__).parent / "models" / "cervirisk_mm_v0.1.pkl",
+    ]
+    for c in candidates:
+        if c.exists():
+            return joblib.load(c), c
+    return None, None
+
+
+@st.cache_resource
+def load_metrics() -> dict | None:
+    for c in (Path("models/metrics.json"),
+              Path(__file__).parent / "models" / "metrics.json"):
+        if c.exists():
+            try:
+                return json.loads(c.read_text())
+            except Exception:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline helpers
+# ---------------------------------------------------------------------------
+def features_to_row(patient: dict) -> pd.DataFrame:
+    return pd.DataFrame([{f: patient.get(f, None) for f in ALL_FEATURES}])
+
+
+def tier_for(p: float) -> str:
+    if p < 0.20:
+        return "low"
+    if p < 0.50:
+        return "moderate"
+    return "high"
+
+
+def compute_shap(model, df: pd.DataFrame, top_k: int = 10) -> list[dict]:
+    """Use XGBoost's built-in TreeSHAP (avoids SHAP-library version coupling)."""
     try:
-        r = requests.get(f"{url}{path}", timeout=timeout)
-        if r.status_code == 200:
-            return True, r.json(), None
-        return False, None, f"HTTP {r.status_code}: {r.text[:200]}"
-    except requests.exceptions.ConnectionError:
-        return False, None, "Connection refused — is the API running?"
-    except requests.exceptions.Timeout:
-        return False, None, "Timed out"
+        pre = model.named_steps["pre"]
+        clf = model.named_steps["clf"]
+        X_t = pre.transform(df)
+        try:
+            feature_names = list(pre.get_feature_names_out())
+        except Exception:
+            feature_names = [f"f{i}" for i in range(X_t.shape[1])]
+
+        import xgboost as xgb
+        booster = clf.get_booster()
+        try:
+            dmat = xgb.DMatrix(X_t, feature_names=booster.feature_names)
+        except Exception:
+            dmat = xgb.DMatrix(X_t)
+        contribs = booster.predict(dmat, pred_contribs=True)
+        shap_row = contribs[0, :-1]
+
+        ranked = []
+        for raw, val, contrib in zip(feature_names, X_t[0], shap_row):
+            name = raw.split("__", 1)[1] if "__" in raw else raw
+            for prefix in ("assigned_hpv_strain_", "matched_super_pop_"):
+                if name.startswith(prefix):
+                    base = prefix.rstrip("_")
+                    value = name[len(prefix):]
+                    name = f"{base}: {value}"
+                    break
+            ranked.append({
+                "name": name,
+                "value": float(val),
+                "contribution": float(contrib),
+                "direction": "up" if contrib > 0 else "down",
+            })
+        ranked.sort(key=lambda r: -abs(r["contribution"]))
+        return ranked[:top_k]
     except Exception as e:
-        return False, None, f"{type(e).__name__}: {e}"
+        return [{"error": f"{type(e).__name__}: {e}"}]
 
 
-def api_post(url: str, path: str, body: dict, timeout: int = 10) -> tuple[bool, dict | None, str | None]:
-    """POST request returning (ok, body, error_message)."""
-    try:
-        r = requests.post(f"{url}{path}", json=body, timeout=timeout)
-        if r.status_code == 200:
-            return True, r.json(), None
-        return False, None, f"HTTP {r.status_code}: {r.text[:300]}"
-    except requests.exceptions.ConnectionError:
-        return False, None, "Connection refused — is the API running?"
-    except Exception as e:
-        return False, None, f"{type(e).__name__}: {e}"
-
-
-def render_tier_badge(tier: str, probability: float) -> None:
-    """Big colored tier badge with probability."""
-    color = TIER_COLORS.get(tier, "#6b7280")
-    st.markdown(f"""
-        <div style="
-            background-color: {color};
-            color: white;
-            padding: 24px;
-            border-radius: 12px;
-            text-align: center;
-            font-family: sans-serif;
-        ">
-            <div style="font-size: 1.1em; opacity: 0.9;">PREDICTED RISK</div>
-            <div style="font-size: 3.5em; font-weight: 700; line-height: 1.0;">
-                {probability*100:.1f}%
-            </div>
-            <div style="font-size: 1.2em; letter-spacing: 0.15em; margin-top: 8px;">
-                TIER: {tier.upper()}
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-
-def render_severity_badge(severity: str, score: float, method: str = "PSI") -> None:
-    """Drift severity badge."""
-    color = SEVERITY_COLORS.get(severity, "#6b7280")
-    st.markdown(f"""
-        <div style="
-            background-color: {color};
-            color: white;
-            padding: 16px;
-            border-radius: 8px;
-            text-align: center;
-            font-family: sans-serif;
-        ">
-            <div style="font-size: 0.9em; opacity: 0.9;">{method} score</div>
-            <div style="font-size: 2.0em; font-weight: 700; line-height: 1.0;">
-                {score:.3f}
-            </div>
-            <div style="font-size: 0.95em; letter-spacing: 0.1em; margin-top: 4px;">
-                {severity.upper()}
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.title("🔬 CerviRisk-MM")
-    st.caption("Cervical cancer risk prediction — research prototype")
-
-    api_url = st.text_input("API URL", value=DEFAULT_API_URL, help="Base URL of the FastAPI service")
-
-    # Connection probe
-    ok, health, err = api_get(api_url, "/health", timeout=2)
-    if ok and health and health.get("model_loaded"):
-        st.success(f"API connected · model loaded")
-    elif ok:
-        st.warning("API up · model NOT loaded")
-        st.caption("Run: `.\\run.ps1 fit` or `.\\run.ps1 train`")
-    else:
-        st.error(f"API unreachable")
-        st.caption(f"_{err}_")
-        st.caption("Start it with: `.\\run.ps1 serve`")
-
-    st.divider()
-
-    # Patient picker
-    st.subheader("Patient")
-    profile_choice = st.radio(
-        "Pick a profile or build a custom patient:",
-        list(SAMPLE_PATIENTS) + ["Custom..."],
-        index=1,  # default to Moderate
-    )
-
-    if profile_choice == "Custom...":
-        st.caption("Adjust below; missing fields are imputed by the model.")
-        with st.expander("Demographics", expanded=True):
-            age = st.slider("Age", 13, 85, 35)
-            partners = st.slider("Number of sexual partners", 0, 30, 3)
-            first_sex = st.slider("First sexual intercourse (age)", 10, 35, 17)
-            pregnancies = st.slider("Number of pregnancies", 0, 10, 1)
-        with st.expander("Lifestyle"):
-            smokes = st.checkbox("Smokes", value=False)
-            smokes_years = st.slider("Smokes (years)", 0, 50, 0, disabled=not smokes)
-            contraceptive = st.checkbox("Hormonal contraceptives", value=False)
-            contraceptive_years = st.slider(
-                "Hormonal contraceptives (years)", 0, 30, 0,
-                disabled=not contraceptive,
-            )
-            iud = st.checkbox("IUD", value=False)
-        with st.expander("STD history"):
-            std = st.checkbox("Any STD history", value=False)
-            std_hpv = st.checkbox("HPV exposure (STDs:HPV)", value=False)
-            dx_hpv = st.checkbox("Prior HPV diagnosis (Dx:HPV)", value=False)
-        with st.expander("Prior screening tests"):
-            hinselmann = st.checkbox("Hinselmann positive", value=False)
-            schiller = st.checkbox("Schiller positive", value=False)
-            citology = st.checkbox("Cytology positive", value=False)
-        with st.expander("🧬 Multi-modal context (genetics + virology)"):
-            # HPV strain — populated from the project's strain catalog
-            STRAIN_OPTIONS = ["(none — no HPV detected)",
-                              "HPV16", "HPV18", "HPV31", "HPV33", "HPV45",
-                              "HPV52", "HPV58", "OTHER_HR_HPV", "LOW_RISK_HPV"]
-            STRAIN_CARCINOGENICITY = {
-                "HPV16": 0.95, "HPV18": 0.85,
-                "HPV31": 0.70, "HPV33": 0.70, "HPV45": 0.70,
-                "HPV52": 0.65, "HPV58": 0.65,
-                "OTHER_HR_HPV": 0.50, "LOW_RISK_HPV": 0.05,
-            }
-            strain_pick = st.selectbox(
-                "Assigned HPV strain",
-                STRAIN_OPTIONS,
-                index=0,
-                help="If a patient sample was genotyped, pick the dominant "
-                     "strain. The model uses both the strain identity and its "
-                     "carcinogenicity score (IARC classification).",
-            )
-            assigned_strain = None if strain_pick.startswith("(none") else strain_pick
-
-            # Ancestry — populated from 1000 Genomes super-populations
-            ANCESTRY_OPTIONS = [
-                ("AMR", "AMR — Admixed American (default for UCI Caracas cohort)"),
-                ("EUR", "EUR — European"),
-                ("AFR", "AFR — African"),
-                ("EAS", "EAS — East Asian"),
-                ("SAS", "SAS — South Asian"),
-            ]
-            ancestry_label = st.selectbox(
-                "Matched ancestry (1000 Genomes)",
-                [label for _, label in ANCESTRY_OPTIONS],
-                index=0,
-                help="The 1000G super-population whose allele frequencies were "
-                     "used to compute this patient's polygenic risk score. "
-                     "Defaults to AMR for the UCI Caracas cohort.",
-            )
-            super_pop = next(code for code, label in ANCESTRY_OPTIONS
-                              if label == ancestry_label)
-
-            # PRS — slider for the polygenic risk score
-            host_prs = st.slider(
-                "Polygenic risk score (PRS)",
-                min_value=0.0, max_value=3.0, value=1.10, step=0.05,
-                help=("Sum of effect-allele dosages × log-OR weights across 11 "
-                       "cervical cancer GWAS loci. Population means: AFR ≈ 1.16, "
-                       "AMR ≈ 1.12, EUR ≈ 1.09, SAS ≈ 1.04 (from your 1000G panel)."),
-            )
-
-        patient = {
-            "Age": age,
-            "Number of sexual partners": partners,
-            "First sexual intercourse": first_sex,
-            "Num of pregnancies": pregnancies,
-            "Smokes": int(smokes),
-            "Smokes (years)": smokes_years if smokes else 0,
-            "Hormonal Contraceptives": int(contraceptive),
-            "Hormonal Contraceptives (years)": contraceptive_years if contraceptive else 0,
-            "IUD": int(iud),
-            "STDs": int(std),
-            "STDs:HPV": int(std_hpv),
-            "Dx:HPV": int(dx_hpv),
-            "Hinselmann": int(hinselmann),
-            "Schiller": int(schiller),
-            "Citology": int(citology),
-            # Multi-modal extras
-            "host_prs": host_prs,
-            "matched_super_pop": super_pop,
-        }
-        if assigned_strain:
-            patient["assigned_hpv_strain"] = assigned_strain
-            patient["strain_carcinogenicity"] = STRAIN_CARCINOGENICITY.get(assigned_strain, 0.0)
-    else:
-        patient = SAMPLE_PATIENTS[profile_choice]
-        with st.expander("Patient features", expanded=False):
-            st.json(patient)
-
-
-# ---------------------------------------------------------------------------
-# Main — three tabs
-# ---------------------------------------------------------------------------
-st.title("CerviRisk-MM")
-st.caption(
-    "Multi-modal cervical cancer risk prediction · "
-    "research prototype, not a medical device"
-)
-
-tab_predict, tab_drift, tab_model = st.tabs([
-    "🎯 Predict",
-    "📊 Drift detection",
-    "ℹ️ Model info",
-])
-
-
-# ---------- Tab 1: Predict --------------------------------------------------
-def _render_modality_bar(label: str, filled: int, total: int, color: str, sublabel: str = "") -> None:
-    """Mini horizontal progress bar for one of the three modalities."""
-    pct = (filled / total * 100) if total > 0 else 0
-    st.markdown(f"""
-        <div style="margin-bottom: 4px;">
-            <div style="
-                display: flex;
-                justify-content: space-between;
-                font-family: sans-serif;
-                font-size: 0.85em;
-                color: #4b5563;
-                margin-bottom: 2px;
-            ">
-                <span><b>{label}</b></span>
-                <span style="color: {color};">{sublabel}</span>
-            </div>
-            <div style="
-                background: #e5e7eb;
-                height: 10px;
-                border-radius: 5px;
-                overflow: hidden;
-            ">
-                <div style="
-                    background: {color};
-                    height: 100%;
-                    width: {pct:.0f}%;
-                "></div>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-
-
-def _resolve_raw_value(feature_id: str, display_name: str, patient_dict: dict) -> str:
-    """Map a SHAP feature back to the patient's original (pre-preprocessing) value.
-
-    Handles three cases:
-      1. Plain numeric: 'num__Age' → patient['Age'] → "45"
-      2. One-hot category: 'cat__assigned_hpv_strain_HPV16' → "yes" or "no"
-      3. Unknown: fall back to "—"
-    """
-    name = feature_id
-    if "__" in name:
-        name = name.split("__", 1)[1]
-
-    # One-hot expansion like "assigned_hpv_strain_HPV16"
-    for col in ("assigned_hpv_strain", "matched_super_pop"):
-        if name.startswith(col + "_"):
-            value = name[len(col) + 1:]
-            return "yes" if patient_dict.get(col) == value else "no"
-
-    raw = patient_dict.get(name)
+def resolve_raw_value(name: str, patient: dict) -> str:
+    for prefix in ("assigned_hpv_strain", "matched_super_pop"):
+        if name.startswith(prefix + ":"):
+            wanted = name.split(": ", 1)[1]
+            return "yes" if patient.get(prefix) == wanted else "no"
+    raw = patient.get(name)
     if raw is None:
         return "—"
-    # Binary fields show as yes/no for readability
     if isinstance(raw, (int, float)) and raw in (0, 1):
-        # but only if the feature itself is binary-ish
         if name in {"Smokes", "Hormonal Contraceptives", "IUD",
                      "STDs", "STDs:HPV", "STDs:HIV",
                      "Dx:Cancer", "Dx:CIN", "Dx:HPV",
@@ -374,517 +193,270 @@ def _resolve_raw_value(feature_id: str, display_name: str, patient_dict: dict) -
     return str(raw)
 
 
-def _render_contribution_row(rank: int, item: dict, max_abs: float,
-                              patient_dict: dict) -> None:
-    """One line in the feature-contribution panel — theme-agnostic colors."""
-    contrib = item["contribution"]
-    direction = item["direction"]
-    width_pct = (abs(contrib) / max_abs * 100) if max_abs > 0 else 0
-    bar_color = "#dc2626" if direction == "increases_risk" else "#16a34a"
-    text_color = "#f87171" if direction == "increases_risk" else "#4ade80"
-    arrow = "↑" if direction == "increases_risk" else "↓" if direction == "decreases_risk" else "→"
-    name = item["display_name"]
-    raw_value = _resolve_raw_value(item.get("feature", ""), name, patient_dict)
-    # CSS variables in Streamlit's theme:
-    #   --text-color is white in dark mode, dark gray in light mode
-    # We use it directly so contrast is correct in both themes.
+def render_tier_badge(tier: str, prob: float) -> None:
+    color = TIER_COLORS.get(tier, BRAND_MUTED)
     st.markdown(f"""
-        <div style="
-            display: grid;
-            grid-template-columns: 28px 240px 1fr 130px 90px;
-            align-items: center;
-            font-family: sans-serif;
-            font-size: 0.92em;
-            padding: 6px 0;
-            border-bottom: 1px solid rgba(128,128,128,0.18);
-        ">
-            <div style="color: var(--text-color); opacity: 0.5;">#{rank}</div>
-            <div style="color: var(--text-color); font-weight: 500;">{name}</div>
-            <div style="background: rgba(128,128,128,0.18); border-radius: 4px;
-                         height: 14px; position: relative;
-                         margin: 0 16px;">
-                <div style="
-                    background: {bar_color};
-                    height: 100%;
-                    width: {width_pct:.0f}%;
-                    border-radius: 4px;
-                "></div>
+        <div style="background:{color};color:white;padding:24px;
+                     border-radius:12px;text-align:center;font-family:sans-serif;">
+            <div style="font-size:1.1em;opacity:0.9;">PREDICTED RISK</div>
+            <div style="font-size:3.5em;font-weight:700;line-height:1.0;">
+                {prob*100:.1f}%
             </div>
-            <div style="color: var(--text-color); opacity: 0.85;
-                         text-align: right; padding-right: 12px;
-                         font-size: 0.9em;">
-                input: <b style="opacity:1.0;">{raw_value}</b>
-            </div>
-            <div style="color: {text_color}; text-align: right; font-weight: 700;">
-                {arrow} {contrib:+.3f}
+            <div style="font-size:1.2em;letter-spacing:0.15em;margin-top:8px;">
+                TIER: {tier.upper()}
             </div>
         </div>
     """, unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    logo_path = Path("frontend/assets/logo.png")
+    if logo_path.exists():
+        st.image(str(logo_path), use_container_width=True)
+    else:
+        st.title("CerviRisk-MM")
+    st.caption("Multi-modal cervical cancer risk prediction · research prototype")
+    st.divider()
+
+    model, model_path = load_model()
+    if model is None:
+        st.error("Model artifact not found in the repo.")
+        st.caption(
+            "If you're running locally, train the model with: `.\\run.ps1 fit` "
+            "or `.\\run.ps1 train`."
+        )
+        st.stop()
+    st.success("Model loaded")
+    st.caption(f"`{model_path}`")
+
+    st.divider()
+    profile_choice = st.radio(
+        "Pick a patient profile:",
+        list(SAMPLE_PATIENTS) + ["Custom..."],
+        index=1,
+    )
+
+    if profile_choice == "Custom...":
+        with st.expander("Demographics", expanded=True):
+            age = st.slider("Age", 13, 85, 35)
+            partners = st.slider("Number of sexual partners", 0, 30, 3)
+            first_sex = st.slider("First sexual intercourse (age)", 10, 35, 17)
+            pregnancies = st.slider("Number of pregnancies", 0, 10, 1)
+        with st.expander("Lifestyle"):
+            smokes = st.checkbox("Smokes")
+            smokes_years = st.slider("Smokes (years)", 0, 50, 0, disabled=not smokes)
+            contraceptive = st.checkbox("Hormonal contraceptives")
+            iud = st.checkbox("IUD")
+        with st.expander("STD history"):
+            std = st.checkbox("Any STD history")
+            std_hpv = st.checkbox("HPV exposure")
+            dx_hpv = st.checkbox("Prior HPV diagnosis")
+        with st.expander("Prior screening tests"):
+            hinselmann = st.checkbox("Hinselmann positive")
+            schiller = st.checkbox("Schiller positive")
+            citology = st.checkbox("Cytology positive")
+        with st.expander("Multi-modal context (genetics + virology)"):
+            strain_pick = st.selectbox(
+                "Assigned HPV strain",
+                ["(none — no HPV detected)", "HPV16", "HPV18", "HPV31",
+                 "HPV33", "HPV45", "HPV52", "HPV58",
+                 "OTHER_HR_HPV", "LOW_RISK_HPV"],
+            )
+            super_pop = st.selectbox(
+                "Matched ancestry (1000G)",
+                ["AMR", "EUR", "AFR", "EAS", "SAS"],
+            )
+            host_prs = st.slider("Polygenic risk score (PRS)",
+                                  0.0, 3.0, 1.10, 0.05)
+
+        patient = {
+            "Age": age, "Number of sexual partners": partners,
+            "First sexual intercourse": first_sex,
+            "Num of pregnancies": pregnancies,
+            "Smokes": int(smokes), "Smokes (years)": smokes_years if smokes else 0,
+            "Hormonal Contraceptives": int(contraceptive),
+            "IUD": int(iud), "STDs": int(std),
+            "STDs:HPV": int(std_hpv), "Dx:HPV": int(dx_hpv),
+            "Hinselmann": int(hinselmann), "Schiller": int(schiller),
+            "Citology": int(citology),
+            "host_prs": host_prs, "matched_super_pop": super_pop,
+        }
+        if not strain_pick.startswith("(none"):
+            patient["assigned_hpv_strain"] = strain_pick
+            patient["strain_carcinogenicity"] = {
+                "HPV16": 0.95, "HPV18": 0.85,
+                "HPV31": 0.70, "HPV33": 0.70, "HPV45": 0.70,
+                "HPV52": 0.65, "HPV58": 0.65,
+                "OTHER_HR_HPV": 0.50, "LOW_RISK_HPV": 0.05,
+            }.get(strain_pick, 0.0)
+    else:
+        patient = SAMPLE_PATIENTS[profile_choice]
+        with st.expander("Submitted features", expanded=False):
+            st.json(patient)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+st.title("CerviRisk-MM")
+st.caption(
+    "Multi-modal cervical cancer risk prediction · research prototype, "
+    "not a medical device"
+)
+
+tab_predict, tab_about = st.tabs(["Predict", "About this model"])
+
 with tab_predict:
-    if st.button("🎯 Run prediction", type="primary", use_container_width=True):
-        with st.spinner("Calling /predict/cervical-risk..."):
-            ok, body, err = api_post(api_url, "/predict/cervical-risk", patient)
+    if st.button("Run prediction", type="primary", use_container_width=True):
+        df = features_to_row(patient)
+        try:
+            proba = float(model.predict_proba(df)[0, 1])
+        except Exception as e:
+            st.error(f"Prediction failed: {type(e).__name__}: {e}")
+            st.stop()
 
-        if not ok:
-            st.error(f"Prediction failed: {err}")
+        tier = tier_for(proba)
+        col_summary, col_risk = st.columns([2, 1])
+        with col_summary:
+            st.subheader("Patient assessment")
+            age_val = patient.get("Age", "?")
+            pop = patient.get("matched_super_pop", "—")
+            st.markdown(f"  **{age_val} yo** patient · ancestry: **{pop}**")
+            cl = []
+            if patient.get("Smokes"):
+                cl.append(f"smoker ({patient.get('Smokes (years)', '?')}y)")
+            screening_pos = sum(int(bool(patient.get(k, 0))) for k in
+                                  ("Hinselmann", "Schiller", "Citology"))
+            if screening_pos > 0:
+                cl.append(f"{screening_pos}/3 screening tests positive")
+            if cl:
+                st.markdown(f"  **Clinical** — {', '.join(cl)}")
+            if patient.get("host_prs") is not None:
+                st.markdown(f"  **Host genetics** — PRS {patient['host_prs']:.2f}")
+            strain = patient.get("assigned_hpv_strain")
+            if strain:
+                carc = patient.get("strain_carcinogenicity")
+                line = f"  **Viral** — {strain}"
+                if carc is not None:
+                    line += f" · carcinogenicity {carc}"
+                st.markdown(line)
+
+        with col_risk:
+            render_tier_badge(tier, proba)
+            rec = {
+                "low":      "Routine screening, next cycle.",
+                "moderate": "Expedited follow-up; repeat cytology in 6 months.",
+                "high":     "Refer for diagnostic biopsy.",
+            }[tier]
+            st.markdown(f"<div style='text-align:center;margin-top:8px;"
+                        f"font-weight:600;'>{rec}</div>",
+                        unsafe_allow_html=True)
+
+        st.divider()
+        st.subheader("Feature contributions")
+        st.caption(
+            "Top features pushing this prediction toward HIGH (magenta, ↑) or "
+            "LOW (navy, ↓) risk. Computed via XGBoost built-in TreeSHAP."
+        )
+        contributors = compute_shap(model, df, top_k=10)
+        if contributors and "error" not in contributors[0]:
+            max_abs = max(abs(c["contribution"]) for c in contributors)
+            for i, c in enumerate(contributors, 1):
+                color = BRAND_MAGENTA_BAR if c["direction"] == "up" else BRAND_NAVY_BAR
+                arrow = "↑" if c["direction"] == "up" else "↓"
+                width = abs(c["contribution"]) / max_abs * 100
+                raw_val = resolve_raw_value(c["name"], patient)
+                st.markdown(f"""
+                    <div style="display:grid;
+                                 grid-template-columns:28px 220px 1fr 110px 90px;
+                                 align-items:center;font-family:sans-serif;
+                                 font-size:0.9em;padding:5px 0;
+                                 border-bottom:1px solid rgba(128,128,128,0.15);">
+                        <div style="color:var(--text-color);opacity:0.5;">#{i}</div>
+                        <div style="color:var(--text-color);font-weight:500;">{c['name']}</div>
+                        <div style="background:rgba(128,128,128,0.18);
+                                     border-radius:4px;height:14px;margin:0 16px;">
+                            <div style="background:{color};height:100%;
+                                         width:{width:.0f}%;border-radius:4px;"></div>
+                        </div>
+                        <div style="color:var(--text-color);opacity:0.85;
+                                     text-align:right;padding-right:12px;
+                                     font-size:0.85em;">
+                            input: <b style="opacity:1.0;">{raw_val}</b>
+                        </div>
+                        <div style="color:{color};text-align:right;
+                                     font-weight:700;">{arrow} {c['contribution']:+.3f}</div>
+                    </div>
+                """, unsafe_allow_html=True)
         else:
-            audit = body.get("audit") or {}
-            explanation = body.get("explanation") or {}
+            err = contributors[0].get("error", "unknown") if contributors else "no output"
+            st.warning(f"Feature contributions unavailable: `{err}`")
 
-            # ===========================================================
-            # ROW 1: Patient summary card + Big risk badge
-            # ===========================================================
-            col_summary, col_risk = st.columns([2, 1])
-
-            with col_summary:
-                host = audit.get("host_genetics", {}) or {}
-                viral = audit.get("hpv_viral", {}) or {}
-                clinical = audit.get("clinical", {}) or {}
-
-                summary_lines = []
-                age = patient.get("Age", "?")
-                pop = host.get("matched_super_pop") or "—"
-                summary_lines.append(f"**{age} yo** patient · ancestry: **{pop}**")
-
-                cl_text = []
-                if patient.get("Smokes"):
-                    cl_text.append(f"smoker ({patient.get('Smokes (years)', '?')}y)")
-                if patient.get("Number of sexual partners"):
-                    cl_text.append(f"{patient.get('Number of sexual partners')} partners")
-                pos_screen = clinical.get("screening_tests_positive", 0)
-                tot_screen = clinical.get("screening_tests_total", 3)
-                if pos_screen > 0:
-                    cl_text.append(f"{pos_screen}/{tot_screen} screening tests positive")
-
-                summary_lines.append("**Clinical** — " + (", ".join(cl_text) if cl_text else "no flagged risk factors"))
-
-                if host.get("polygenic_risk_score") is not None:
-                    prs = host['polygenic_risk_score']
-                    pct = host.get("percentile_in_training_distribution")
-                    interp = host.get("interpretation", "—")
-                    pct_str = f" ({pct}th percentile)" if pct is not None else ""
-                    summary_lines.append(f"**Host genetics** — PRS {prs}{pct_str} · {interp}")
-
-                if viral.get("assigned_strain"):
-                    strain = viral["assigned_strain"]
-                    carc = viral.get("carcinogenicity")
-                    iarc = viral.get("iarc_classification") or "—"
-                    summary_lines.append(
-                        f"**Viral** — assigned {strain}"
-                        + (f" · carcinogenicity {carc}" if carc is not None else "")
-                        + f" · {iarc}"
-                    )
-
-                st.markdown("##### Patient assessment")
-                for line in summary_lines:
-                    st.markdown(f"  {line}")
-                st.caption(f"Model: `{body.get('model_version', '—')}` · "
-                            f"data_status: `{body.get('data_status', '—')}`")
-
-            with col_risk:
-                render_tier_badge(body["tier"], body["risk_probability"])
-                rec = {
-                    "low":      "Routine screening, next cycle.",
-                    "moderate": "Expedited follow-up; repeat cytology in 6 months.",
-                    "high":     "Refer for diagnostic biopsy.",
-                }.get(body["tier"], "—")
-                st.markdown(f"<div style='text-align:center; margin-top:8px; "
-                            f"font-weight:600;'>{rec}</div>",
-                            unsafe_allow_html=True)
-
-            st.divider()
-
-            # ===========================================================
-            # ROW 2: Feature contributions panel
-            # ===========================================================
-            st.markdown("##### 🔬 Feature contributions to this classification")
-            st.caption(
-                "Top features pushing this prediction toward HIGH (red, ↑) or "
-                "LOW (green, ↓) risk. Computed via SHAP TreeExplainer on the "
-                "deployed model — same direction and magnitude the model used."
-            )
-
-            contributors = explanation.get("top_contributors") or []
-            if not contributors:
-                # Show the actual reason for failure so we can debug
-                method = explanation.get("method", "unavailable")
-                err = explanation.get("error")
-                clf_type = explanation.get("classifier_type")
-                if err:
-                    st.warning(
-                        f"**Feature contributions unavailable** — {method}\n\n"
-                        f"_Reason:_ `{err}`"
-                        + (f"\n\n_Classifier:_ `{clf_type}`" if clf_type else "")
-                    )
-                else:
-                    st.info(
-                        "Per-prediction feature contributions are not available."
-                    )
-            else:
-                max_abs = max(abs(c["contribution"]) for c in contributors)
-                for i, c in enumerate(contributors, 1):
-                    _render_contribution_row(i, c, max_abs, patient)
-                st.caption(
-                    f"_Method: {explanation.get('method', 'SHAP')} · "
-                    f"{explanation.get('n_features_in_model', '?')} features in model · "
-                    "the **input** column shows the raw patient value submitted; "
-                    "the **±** column shows the model's log-odds contribution._"
-                )
-
-            st.divider()
-
-            # ===========================================================
-            # ROW 3: Multi-modal evidence integration
-            # ===========================================================
-            st.markdown("##### 🧬 Multi-modal evidence integration")
-            st.caption(
-                "How each evidence modality contributes to the overall picture. "
-                "The deployed `triage + xgb` model integrates all three in the "
-                "same probability."
-            )
-            col_clin, col_host, col_viral = st.columns(3)
-
-            with col_clin:
-                pos = clinical.get("screening_tests_positive", 0)
-                tot = clinical.get("screening_tests_total", 3)
-                rf = clinical.get("high_risk_factors_count", 0)
-                rf_max = clinical.get("high_risk_factors_max", 4)
-                cl_label = ("HIGH" if pos >= 2 else "MODERATE"
-                            if pos == 1 or rf >= 2 else "NORMAL")
-                cl_color = ("#dc2626" if cl_label == "HIGH"
-                            else "#d97706" if cl_label == "MODERATE"
-                            else "#16a34a")
-                st.markdown(f"**CLINICAL** &nbsp; <span style='color:{cl_color}; "
-                            f"font-weight:700; letter-spacing:0.05em;'>{cl_label}</span>",
-                            unsafe_allow_html=True)
-                _render_modality_bar(
-                    f"Screening tests",
-                    pos, tot, cl_color, f"{pos}/{tot} positive"
-                )
-                _render_modality_bar(
-                    f"Lifestyle risk factors",
-                    rf, rf_max, cl_color, f"{rf}/{rf_max}"
-                )
-
-            with col_host:
-                pct = host.get("percentile_in_training_distribution")
-                interp = host.get("interpretation", "not_provided")
-                hcolor = ("#dc2626" if interp == "elevated"
-                          else "#d97706" if interp == "average"
-                          else "#16a34a" if interp == "lower"
-                          else "#9ca3af")
-                hlabel = interp.upper().replace("_", " ")
-                st.markdown(f"**HOST GENETICS** &nbsp; <span style='color:{hcolor}; "
-                            f"font-weight:700; letter-spacing:0.05em;'>{hlabel}</span>",
-                            unsafe_allow_html=True)
-                if pct is not None:
-                    _render_modality_bar(
-                        f"PRS percentile",
-                        pct, 100, hcolor, f"{pct}th percentile",
-                    )
-                else:
-                    st.caption("_PRS percentile unavailable (baseline not loaded)_")
-                pop = host.get("matched_super_pop") or "—"
-                st.caption(f"Matched ancestry: **{pop}** (1000 Genomes panel)")
-
-            with col_viral:
-                strain = viral.get("assigned_strain")
-                carc = viral.get("carcinogenicity")
-                iarc = viral.get("iarc_classification") or "—"
-                vlabel = ("HIGH-RISK" if carc and carc >= 0.7
-                          else "MODERATE" if carc and carc >= 0.3
-                          else "LOW-RISK" if carc is not None
-                          else "NO STRAIN")
-                vcolor = ("#dc2626" if vlabel == "HIGH-RISK"
-                          else "#d97706" if vlabel == "MODERATE"
-                          else "#16a34a" if vlabel == "LOW-RISK"
-                          else "#9ca3af")
-                st.markdown(f"**VIRAL** &nbsp; <span style='color:{vcolor}; "
-                            f"font-weight:700; letter-spacing:0.05em;'>{vlabel}</span>",
-                            unsafe_allow_html=True)
-                if strain:
-                    if carc is not None:
-                        _render_modality_bar(
-                            f"Carcinogenicity",
-                            int(carc * 100), 100, vcolor,
-                            f"{carc:.2f}",
-                        )
-                    st.caption(f"Strain: **{strain}** · {iarc}")
-                else:
-                    st.caption("_No HPV strain assigned to this patient_")
-
-            st.divider()
-
-            # Collapsible technical details
-            with st.expander("📋 Full API response (JSON)"):
-                st.json(body)
-            with st.expander("Patient features submitted"):
-                st.json(patient)
-
+        st.divider()
+        with st.expander("Raw output"):
+            st.json({
+                "risk_probability": round(proba, 4),
+                "tier": tier,
+                "model_version": "cervirisk_mm_v0.1",
+                "data_status": "RESEARCH_PROTOTYPE",
+                "disclaimer": DISCLAIMER,
+            })
     else:
         st.info(
             "Configure the patient in the sidebar, then click **Run prediction**. "
-            "Sample profiles are available; you can also build a custom patient."
+            "Three sample profiles are available; you can also build a custom patient."
         )
 
-
-# ---------- Tab 2: Drift ----------------------------------------------------
-with tab_drift:
-    # ---- LIVE NCBI section (top, with auto-refresh) -----------------------
-    st.markdown("#### 🔴 LIVE — direct from NCBI E-utilities")
-    st.caption(
-        "Pulls HPV sequence deposits from the last 30 days, computes the "
-        "strain distribution, and compares against the published de Sanjosé "
-        "2010 baseline. Auto-refreshes every minute. NCBI is hit at most "
-        "once every 5 minutes (server-side cache)."
+with tab_about:
+    st.subheader("About this Space")
+    st.markdown(
+        "This is the **live demo** of CerviRisk-MM, a multi-modal cervical "
+        "cancer risk prediction pipeline built for the Karolinska Institutet "
+        "PhD application (Center for Cervical Cancer Elimination)."
+    )
+    st.markdown(
+        "**This demo runs the deployed model only.** The full pipeline — "
+        "FastAPI service, drift detection against live NCBI feed, 53 "
+        "automated tests, Docker deployment, GitHub Actions CI — is available "
+        "in the source repository."
     )
 
-    # Auto-refresh — every 60 seconds
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=60_000, key="ncbi_live_refresh")
-        _autorefresh_ok = True
-    except ImportError:
-        _autorefresh_ok = False
-        st.caption("(install `streamlit-autorefresh` to enable auto-polling — "
-                   "manual refresh below still works)")
-
-    col_a, col_b = st.columns([1, 4])
-    with col_a:
-        force = st.button("Refresh now")
-    with col_b:
-        st.caption("Click to force-bypass the 5-minute server cache.")
-
-    ok, live, err = api_get(api_url, f"/drift/strain/live?force_refresh={'true' if force else 'false'}", timeout=15)
-    if not ok:
-        st.error(f"Live fetch failed: {err}")
-    elif live and not live.get("ncbi_meta", {}).get("ok", True):
-        st.error(f"NCBI unavailable: {live['ncbi_meta'].get('error', 'unknown')}")
-        st.caption(f"Query was: `{live['ncbi_meta'].get('query', '?')}`")
-    elif live:
-        cache_source = live.get("cache_source", "?")
-        cache_age = live.get("cache_age_seconds", 0)
-        n_seqs = live.get("n_sequences_typed", 0)
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Sequences (last 30d)", n_seqs)
-        col2.metric("Cache source",
-                    "FRESH" if cache_source == "fresh" else "CACHED",
-                    delta=f"{int(cache_age)}s old" if cache_source == "cached" else "just fetched")
-        col3.metric("PSI vs baseline", f"{live['psi_score']:.3f}")
-        col4.metric("Severity", live["psi_severity"].upper())
-
-        # Big action badge
-        action = live.get("action_recommended", "no_action")
-        action_color = {
-            "retrain":   "#dc2626",
-            "monitor":   "#d97706",
-            "no_action": "#16a34a",
-        }.get(action, "#6b7280")
-        st.markdown(f"""
-            <div style="
-                background-color: {action_color};
-                color: white;
-                padding: 12px;
-                border-radius: 8px;
-                text-align: center;
-                font-family: sans-serif;
-                margin: 16px 0;
-            ">
-                <div style="font-size: 0.85em; opacity: 0.9;">RECOMMENDED ACTION</div>
-                <div style="font-size: 1.6em; font-weight: 700; letter-spacing: 0.05em;">
-                    {action.upper().replace('_', ' ')}
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
-
-        # Side-by-side bar chart
-        baseline_dist = live.get("baseline_distribution", {})
-        current_dist = live.get("current_distribution", {})
-        if baseline_dist and current_dist:
-            strains = sorted(set(baseline_dist) | set(current_dist),
-                              key=lambda k: -baseline_dist.get(k, 0))
-            df_compare = pd.DataFrame({
-                "Baseline (de Sanjosé 2010)": [baseline_dist.get(k, 0) for k in strains],
-                "LIVE (NCBI last 30d)":        [current_dist.get(k, 0) for k in strains],
-            }, index=strains)
-            st.bar_chart(df_compare)
-
-        # Top contributors
-        contribs = live.get("top_contributors", {})
-        if contribs:
-            with st.expander("Top drift contributors"):
-                rows = []
-                for cat, v in contribs.items():
-                    arrow = "↑" if current_dist.get(cat, 0) > baseline_dist.get(cat, 0) else "↓"
-                    rows.append({"strain": cat, "direction": arrow,
-                                 "contribution": round(v, 4)})
-                st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                             hide_index=True)
-
-        chi_p = live.get("chi_square_pvalue", 1.0)
-        chi_drift = chi_p < 0.05
-        st.caption(
-            f"Chi-square goodness-of-fit p-value: **{chi_p:.4f}** "
-            f"({'drift detected' if chi_drift else 'no drift'}). "
-            f"Last fetched at: {live.get('fetched_at', '—')}."
-        )
-
-    st.divider()
-
-    # ---- Static baseline section (existing) -------------------------------
-    st.markdown("#### 📁 Saved training baseline vs uploaded batch")
-    st.caption(
-        "Drift detection compares incoming patient batches against the "
-        "training-time baseline. PSI ≥ 0.20 = significant drift, "
-        "PSI ≥ 0.10 = minor, < 0.10 = no drift."
-    )
-
-    if st.button("Fetch saved baseline", use_container_width=True):
-        ok, body, err = api_get(api_url, "/drift/baseline")
-        if not ok:
-            st.error(f"Could not load baseline: {err}")
-            st.caption("Run: `.\\run.ps1 baseline`")
-        else:
-            st.session_state["baseline"] = body
-
-    if "baseline" in st.session_state:
-        baseline = st.session_state["baseline"]
-        st.success(f"Baseline loaded · {baseline.get('n_records', '?')} reference patients")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Captured at", baseline.get("captured_at", "—")[:10])
-        with col2:
-            cat_count = len(baseline.get("categorical_features", {}))
-            num_count = len(baseline.get("numeric_features", {}))
-            st.metric("Features tracked", f"{num_count} numeric, {cat_count} categorical")
-
-        # Visualize strain distribution if available
-        strains = baseline.get("categorical_features", {}).get("assigned_hpv_strain")
-        if strains and "proportions" in strains:
-            st.subheader("Baseline HPV strain composition")
-            df = pd.DataFrame(
-                [{"strain": k, "proportion": v} for k, v in strains["proportions"].items()]
-            ).sort_values("proportion", ascending=False)
-            st.bar_chart(df.set_index("strain"))
-
-    st.divider()
-    st.markdown("##### Run drift check on a batch")
-    st.caption(
-        "Submit one or many patient records to check against the baseline. "
-        "The current sidebar patient is used; click multiple times to "
-        "simulate batches with this profile."
-    )
-
-    n_copies = st.slider("Number of copies to submit", 5, 200, 50,
-                          help="More records → tighter drift estimate")
-
-    if st.button("Run drift check", use_container_width=True):
-        body = {"records": [patient] * n_copies}
-        ok, drift_body, err = api_post(api_url, "/drift/check", body)
-        if not ok:
-            st.error(f"Drift check failed: {err}")
-        else:
-            action = drift_body["action_recommended"]
-            severity_color = {"retrain": "#dc2626",
-                              "monitor": "#d97706",
-                              "no_action": "#16a34a"}.get(action, "#6b7280")
-            st.markdown(f"""
-                <div style="
-                    background-color: {severity_color};
-                    color: white;
-                    padding: 16px;
-                    border-radius: 8px;
-                    text-align: center;
-                    font-family: sans-serif;
-                    margin: 16px 0;
-                ">
-                    <div style="font-size: 1.0em; opacity: 0.9;">RECOMMENDED ACTION</div>
-                    <div style="font-size: 2.0em; font-weight: 700; letter-spacing: 0.05em;">
-                        {action.upper().replace('_', ' ')}
-                    </div>
-                    <div style="font-size: 0.9em; margin-top: 4px;">
-                        {drift_body['n_features_with_drift']} of
-                        {drift_body['n_features_checked']} features drifted
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-
-            st.subheader("Per-feature drift scores")
-            rows = []
-            for f in drift_body.get("by_feature", []):
-                rows.append({
-                    "feature": f["feature"],
-                    "method": f["method"].upper(),
-                    "score": f["score"],
-                    "severity": f["severity"],
-                    "drift": "✔" if f["drift_detected"] else "—",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                             hide_index=True)
-
-            with st.expander("Full drift response"):
-                st.json(drift_body)
-
-
-# ---------- Tab 3: Model info -----------------------------------------------
-with tab_model:
-    if st.button("Refresh model info", use_container_width=True):
-        ok, body, err = api_get(api_url, "/model/info")
-        if not ok:
-            st.error(f"Could not load model info: {err}")
-        else:
-            st.session_state["model_info"] = body
-
-    info = st.session_state.get("model_info")
-    if info is None:
-        # auto-fetch on first load
-        ok, body, err = api_get(api_url, "/model/info")
-        if ok:
-            info = body
-            st.session_state["model_info"] = body
-
-    if info:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.metric("Model", info.get("model_name", "—"))
-            st.metric("Version", info.get("model_version", "—"))
-        with col_b:
-            best = info.get("best_variant") or {}
-            st.metric("Best variant", f"{best.get('mode')} + {best.get('model')}"
-                      if best.get("mode") else "—")
-            st.metric("Eval protocol", best.get("eval", "—"))
-
-        if best:
-            st.subheader("Held-out performance")
+    metrics = load_metrics()
+    if metrics:
+        st.subheader("Deployed model — performance")
+        try:
+            best = max(metrics, key=lambda r: ((r.get("dev") or {})
+                        .get("youden", {}).get("auprc", 0)
+                        if isinstance(r.get("dev"), dict) else 0))
             cols = st.columns(4)
             cols[0].metric("DEV AUPRC", f"{best.get('dev_auprc_pct', '—')}%")
             cols[1].metric("DEV AUROC", f"{best.get('dev_auroc_pct', '—')}%")
-            cols[2].metric("DEV Sens", f"{best.get('dev_sensitivity_pct', '—')}%")
-            cols[3].metric("DEV Spec", f"{best.get('dev_specificity_pct', '—')}%")
+            cols[2].metric("Sensitivity", f"{best.get('dev_sensitivity_pct', '—')}%")
+            cols[3].metric("Specificity", f"{best.get('dev_specificity_pct', '—')}%")
+            st.caption(f"Variant: `{best.get('mode')} + {best.get('model')}`")
+        except Exception:
+            pass
 
-            cols = st.columns(4)
-            cols[0].metric("TEST AUPRC",
-                            f"{best.get('test_auprc_pct', '—')}% "
-                            f"± {best.get('test_auprc_std_pct', '—')}%")
+    st.subheader("Honest limitations")
+    st.markdown(
+        "- **Small training cohort** (n = 858 from a single Venezuelan clinic). "
+        "Geographic generalization is not validated.\n"
+        "- **The deployed model is `triage + xgb`** — a referral decision-support "
+        "tool that assumes prior screening tests exist (Hinselmann, Schiller, "
+        "cytology). It is not a primary screening tool.\n"
+        "- **The host PRS is `BIOLOGICALLY_INFORMED_SYNTHETIC`** — real GWAS "
+        "biology, but per-individual genotypes are sampled from population "
+        "allele frequencies, not from real VCFs.\n"
+        "- **Augmentation did not improve over UCI-only features** on this "
+        "cohort — reported honestly because the architecture is the deliverable, "
+        "not the metric."
+    )
 
-        st.subheader("Notes")
-        for note in info.get("notes", []):
-            st.write(f"- {note}")
-
-        with st.expander("Tuned hyperparameters across all variants"):
-            st.json(info.get("tuned_hyperparameters") or {})
-
-
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
 st.divider()
 st.caption(
-    f"_Generated at {datetime.utcnow().isoformat(timespec='seconds')} UTC. "
-    f"Research prototype — not a medical device._"
+    f"Generated at {datetime.utcnow().isoformat(timespec='seconds')} UTC · "
+    "research prototype — not a medical device."
 )
