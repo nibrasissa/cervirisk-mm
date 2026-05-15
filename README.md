@@ -95,7 +95,7 @@ uvicorn src.api.main:app --reload --port 8000
 | **UCI Cervical Cancer Risk Factors** (id=383) | Anchor — real demographics, history, and biopsy outcomes | 858 patients (55 positives, prevalence 6.4%) | `REAL_OBSERVED` |
 | **NCBI nucleotide via E-utilities** | Live HPV sequence feed for strain prevalence drift detection | 160 deposits in last 12 months (HPV16=63, HPV18=6, others) | `REAL_OBSERVED` (sequences); `SAMPLED_FROM_PRIOR` (patient strain assignments) |
 | **1000 Genomes phase-3 panel** | Ancestry-matched host individuals for PRS placeholder | 2,504 individuals across 5 super-populations (AMR=347 used for the UCI Caracas cohort) | `REAL_OBSERVED` (panel); `REAL_COMPUTED` (PRS placeholder) |
-| **PGS Catalog REST API** | Cervical-cancer-specific polygenic scoring file (best-effort) | 8 candidate scores found; canonical EFO query returned empty | Placeholder for v0.1 — see `docs/DATA_PROVENANCE.md` |
+| **PGS Catalog REST API** | Cervical-cancer-specific polygenic scoring file (best-effort) | 8 candidate scores found; canonical EFO query returned empty | Placeholder for v0.1 see `docs/DATA_PROVENANCE.md` |
 
 The integrity contract: **biopsy outcomes are never overwritten by augmentation**. Every record carries a `data_status` tag  `REAL_OUTCOME` (from UCI), `SYNTHETIC_ASSEMBLY` (any augmented column derived from a sampled prior), or `REAL_COMPUTED` (deterministic features like strain carcinogenicity). Provenance enforcement is tested with `tests/test_ingestion_smoke.py::test_provenance_protects_biopsy_outcome`.
 
@@ -107,9 +107,9 @@ The integrity contract: **biopsy outcomes are never overwritten by augmentation*
 
 | Mode | Features | Clinical question |
 |---|---|---|
-| `uci_only` | 17 UCI risk factors | *Given demographics and history, will biopsy be positive?* (primary screening) |
-| `augmented` | UCI + assigned HPV strain + strain carcinogenicity + host PRS + ancestry | *Adding multi-modal molecular features, can we improve screening?* |
-| `triage` | UCI + Hinselmann + Schiller + Pap cytology | *Given prior screening test results, will biopsy confirm?* (referral decision) |
+| `Conf(1)` | 17 UCI risk factors | *Given demographics and history, will biopsy be positive?* (primary screening) |
+| `Conf (2)` | UCI + assigned HPV strain + strain carcinogenicity + host PRS + ancestry | *Adding multi-modal molecular features, can we improve screening?* |
+| `Conf (3)` | UCI + assigned HPV strain + strain carcinogenicity + host PRS + ancestry + Hinselmann + Schiller + Pap cytology | *Given prior screening test results, will biopsy confirm?* (referral decision) |
 
 ### Six algorithms
 
@@ -122,7 +122,7 @@ The integrity contract: **biopsy outcomes are never overwritten by augmentation*
 | `gbm` | sklearn GradientBoosting with per-sample balanced weights |
 | `xgb` | XGBoost — tuned regularization for small-data regime |
 
-### Evaluation protocol — nested
+### Evaluation protocol based on nested stratgy 
 
 ```
 858 patients
@@ -160,16 +160,8 @@ On the production training run (`--tune --eval nested`), the best variant by DEV
 | Specificity (Youden) | 95.3% | 96.3% ± 2.3% |
 | F1 (default) | 73.6% | 86.4% ± 8.2% |
 
-**Honest interpretation.** The triage model performs strongly because its features (Hinselmann acetowhite reaction, Schiller iodine staining, Pap cytology) are *intermediate diagnostic test results that exist before biopsy in the clinical workflow*. They encode most of the disease signal that biopsy is meant to confirm. The model is therefore a triage / referral aid, not a population screening tool. The pre-screening model (`uci_only`) achieves a much more modest DEV AUPRC of 17.4% — consistent with the literature on 858-patient cohorts and the inherent limits of demographic risk factors alone.
+ The model with configration 3 performs strongly because its features (Hinselmann acetowhite reaction, Schiller iodine staining, Pap cytology) are *intermediate diagnostic test results that exist before biopsy in the clinical workflow*. They encode most of the disease signal that biopsy is meant to confirm. The model is therefore referral aid, not a population screening tool. The pre-screening model (`uci_only(Conf 1)`) achieves a much more modest DEV AUPRC of 17.4% — consistent with the literature on 858-patient cohorts and the inherent limits of demographic risk factors alone.
 
-The wide test-set standard deviations (especially ±26.6% on AUPRC) reflect the small per-fold positive count (~2 positives per 5-fold chunk).
-
-**Negative results reported honestly:**
-
-- **Augmentation does not improve over UCI alone.** Strain assignment reaches only 18 of 858 patients (2.1%) because UCI's HPV reporting is sparse, and the host PRS is a placeholder. The pipeline architecture accepts real strain genotyping from clinical sources unchanged — but on UCI, augmentation has no measurable effect.
-- **IterativeImputer does not improve over SimpleImputer (median).** Tested as a methodological alternative DEV AUPRC differs by <1 percentage point across all six algorithms. The columns with substantial NaN are also the least predictive ones, so no imputer can extract signal that isn't there.
-
-These negative findings are documented for transparency.
 
 ---
 
@@ -265,7 +257,7 @@ All 20 pass on a clean checkout after `python -m src.model.train`.
 
 ---
 
-## Roadmap
+## development Roadmap
 
 - Real cervical-cancer PGS from a working PGS Catalog endpoint (or a manually-computed score from Pujol Gualdo et al. 2023 GWAS summary statistics)
 - Drift detection module (`src/drift/`): PSI and KS tests on incoming HPV strain distributions vs published priors; retrain trigger
@@ -299,4 +291,4 @@ PGS Catalog: Lambert et al., *Nature Genetics* 53, 420 (2021). CC0.
 
 de Sanjosé et al. 2010 HPV prevalence priors: *Lancet Oncology* 11(11), 1048. Used as a published reference distribution.
 
-CerviRisk-MM code: MIT.
+CerviRisk-MM code: MIT reference and LLM troubleshooting
