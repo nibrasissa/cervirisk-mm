@@ -2,7 +2,7 @@
 
 Self-contained: loads the trained model directly with joblib, AND fetches
 live HPV strain composition from NCBI E-utilities to compute drift against
-the published de Sanjosé 2010 prior. No separate FastAPI process needed.
+the published de Sanjose 2010 prior. No separate FastAPI process needed.
 
 Live: https://cervirisk-mm.streamlit.app/
 """
@@ -33,6 +33,7 @@ BRAND_MAGENTA     = "#A12F77"
 BRAND_MAGENTA_BAR = "#D04A9A"
 BRAND_AMBER       = "#D97706"
 BRAND_MUTED       = "#6B7280"
+BRAND_LINE        = "rgba(128,128,128,0.18)"
 
 TIER_COLORS = {
     "low":      BRAND_NAVY,
@@ -41,7 +42,7 @@ TIER_COLORS = {
 }
 
 DISCLAIMER = (
-    "Research prototype — not a medical device. Predictions must not be "
+    "Research prototype, not a medical device. Predictions must not be "
     "used for clinical diagnosis or treatment decisions without appropriate "
     "regulatory approval and clinical validation."
 )
@@ -61,7 +62,7 @@ DEPLOYED_METRICS = {
     },
 }
 
-# Published prior — de Sanjosé et al. Lancet Oncology 11(11):1048 (2010)
+# Published prior — de Sanjose et al. Lancet Oncology 11(11):1048 (2010)
 # Pooled analysis of HPV type distribution in invasive cervical cancer.
 DE_SANJOSE_2010_PRIOR = {
     "HPV16":  0.55,
@@ -142,25 +143,24 @@ def load_baseline() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# LIVE NCBI DRIFT — inlined so no FastAPI process needed
+# Live NCBI drift — inlined so no FastAPI process needed
 # ---------------------------------------------------------------------------
 HPV_TYPE_RE = re.compile(r"(?:type|HPV[-\s]?)(\d{1,3})", re.IGNORECASE)
 KNOWN_HR_TYPES = {"HPV16", "HPV18", "HPV31", "HPV33", "HPV45", "HPV52", "HPV58"}
 
 
-@st.cache_data(ttl=300, show_spinner=False)  # 5-min cache like the FastAPI version
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
     """Pull recent HPV deposits from NCBI and aggregate by type.
 
-    Returns (counts, meta) where counts maps strain → integer and meta
+    Returns (counts, meta) where counts maps strain to integer and meta
     contains diagnostic info (timestamp, total records inspected, etc.).
     """
     from Bio import Entrez
-    Entrez.email = "cervirisk-demo@streamlit.app"   # NCBI etiquette: identify yourself
+    Entrez.email = "cervirisk-demo@streamlit.app"
 
     started = datetime.utcnow()
 
-    # esearch — find recent HPV nucleotide records
     h = Entrez.esearch(
         db="nucleotide",
         term="human papillomavirus[Organism]",
@@ -175,7 +175,6 @@ def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
         return {}, {"started": started.isoformat(), "n_records": 0,
                      "n_typed": 0, "source": "NCBI nucleotide (live)"}
 
-    # esummary — get titles in one batch
     h = Entrez.esummary(db="nucleotide", id=",".join(ids))
     summaries = Entrez.read(h)
     h.close()
@@ -188,7 +187,7 @@ def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
         if not m:
             continue
         n = int(m.group(1))
-        if n > 200:                    # sanity guard against parser false positives
+        if n > 200:
             continue
         key = f"HPV{n}" if f"HPV{n}" in KNOWN_HR_TYPES else "OTHER"
         counts[key] = counts.get(key, 0) + 1
@@ -218,10 +217,10 @@ def compute_psi(observed: dict, expected: dict, epsilon: float = 1e-6) -> float:
 def severity_for_psi(psi: float) -> tuple[str, str, str]:
     """Return (severity, recommendation, color)."""
     if psi < 0.10:
-        return "none",        "No action required.",           BRAND_NAVY
+        return "none",        "No action required.",          BRAND_NAVY
     if psi < 0.20:
-        return "minor",       "Monitor — investigate causes.", BRAND_AMBER
-    return     "significant", "RETRAIN recommended.",          BRAND_MAGENTA
+        return "minor",       "Monitor; investigate causes.", BRAND_AMBER
+    return     "significant", "Retrain recommended.",         BRAND_MAGENTA
 
 
 # ---------------------------------------------------------------------------
@@ -296,16 +295,47 @@ def resolve_raw_value(name: str, patient: dict) -> str:
 
 
 def render_tier_badge(tier: str, prob: float) -> None:
+    """Restrained tier indicator — colored left accent rather than full background."""
     color = TIER_COLORS.get(tier, BRAND_MUTED)
     st.markdown(f"""
-        <div style="background:{color};color:white;padding:24px;
-                     border-radius:12px;text-align:center;font-family:sans-serif;">
-            <div style="font-size:1.1em;opacity:0.9;">PREDICTED RISK</div>
-            <div style="font-size:3.5em;font-weight:700;line-height:1.0;">
+        <div style="border-left:6px solid {color};
+                     padding:14px 18px;border-radius:4px;
+                     background:rgba(128,128,128,0.06);
+                     font-family:sans-serif;">
+            <div style="font-size:0.8em;letter-spacing:0.12em;
+                         opacity:0.75;color:var(--text-color);">
+                PREDICTED RISK
+            </div>
+            <div style="font-size:2.1em;font-weight:600;line-height:1.1;
+                         color:{color};margin-top:2px;">
                 {prob*100:.1f}%
             </div>
-            <div style="font-size:1.2em;letter-spacing:0.15em;margin-top:8px;">
-                TIER: {tier.upper()}
+            <div style="font-size:0.85em;letter-spacing:0.08em;margin-top:4px;
+                         color:var(--text-color);opacity:0.85;">
+                Tier: <b>{tier.lower()}</b>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+
+def render_psi_card(psi: float, severity: str, recommendation: str, color: str) -> None:
+    """Restrained PSI result — accent strip + clean metric block."""
+    st.markdown(f"""
+        <div style="border-left:6px solid {color};
+                     padding:14px 20px;border-radius:4px;
+                     background:rgba(128,128,128,0.06);
+                     font-family:sans-serif;margin:8px 0 16px 0;">
+            <div style="font-size:0.8em;letter-spacing:0.12em;
+                         opacity:0.75;color:var(--text-color);">
+                PSI &nbsp;·&nbsp; OBSERVED VS DE SANJOSE 2010 PRIOR
+            </div>
+            <div style="font-size:2.4em;font-weight:600;line-height:1.1;
+                         color:{color};margin-top:2px;">
+                {psi:.3f}
+            </div>
+            <div style="font-size:0.9em;margin-top:6px;
+                         color:var(--text-color);opacity:0.9;">
+                Severity: <b>{severity}</b>. {recommendation}
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -320,14 +350,14 @@ with st.sidebar:
         st.image(str(logo_path), use_container_width=True)
     else:
         st.title("CerviRisk-MM")
-    st.caption("Multi-modal cervical cancer risk prediction · research prototype")
+    st.caption("Multi-modal cervical cancer risk prediction. Research prototype.")
     st.divider()
 
     model, model_path = load_model()
     if model is None:
         st.error("Model artifact not found in the repo.")
         st.caption(
-            "If you're running locally, train the model with: `.\\run.ps1 fit` "
+            "If you're running locally, train the model with `.\\run.ps1 fit` "
             "or `.\\run.ps1 train`."
         )
         st.stop()
@@ -336,7 +366,7 @@ with st.sidebar:
 
     st.divider()
     profile_choice = st.radio(
-        "Pick a patient profile:",
+        "Pick a patient profile",
         list(SAMPLE_PATIENTS) + ["Custom..."],
         index=1,
     )
@@ -360,10 +390,10 @@ with st.sidebar:
             hinselmann = st.checkbox("Hinselmann positive")
             schiller = st.checkbox("Schiller positive")
             citology = st.checkbox("Cytology positive")
-        with st.expander("Multi-modal context (genetics + virology)"):
+        with st.expander("Multi-modal context (genetics and virology)"):
             strain_pick = st.selectbox(
                 "Assigned HPV strain",
-                ["(none — no HPV detected)", "HPV16", "HPV18", "HPV31",
+                ["(none - no HPV detected)", "HPV16", "HPV18", "HPV31",
                  "HPV33", "HPV45", "HPV52", "HPV58",
                  "OTHER_HR_HPV", "LOW_RISK_HPV"],
             )
@@ -405,12 +435,12 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.title("CerviRisk-MM")
 st.caption(
-    "Multi-modal cervical cancer risk prediction · research prototype, "
-    "not a medical device"
+    "Multi-modal cervical cancer risk prediction. Research prototype, "
+    "not a medical device."
 )
 
 tab_predict, tab_drift, tab_about = st.tabs(
-    ["Predict", "Drift detection (live)", "About this model"]
+    ["Predict", "Drift detection", "About this model"]
 )
 
 # ============================================================================
@@ -431,7 +461,7 @@ with tab_predict:
             st.subheader("Patient assessment")
             age_val = patient.get("Age", "?")
             pop = patient.get("matched_super_pop", "—")
-            st.markdown(f"  **{age_val} yo** patient · ancestry: **{pop}**")
+            st.markdown(f"  **{age_val} yo** patient. Ancestry: **{pop}**.")
             cl = []
             if patient.get("Smokes"):
                 cl.append(f"smoker ({patient.get('Smokes (years)', '?')}y)")
@@ -440,16 +470,16 @@ with tab_predict:
             if screening_pos > 0:
                 cl.append(f"{screening_pos}/3 screening tests positive")
             if cl:
-                st.markdown(f"  **Clinical** — {', '.join(cl)}")
+                st.markdown(f"  Clinical: {', '.join(cl)}.")
             if patient.get("host_prs") is not None:
-                st.markdown(f"  **Host genetics** — PRS {patient['host_prs']:.2f}")
+                st.markdown(f"  Host genetics: PRS {patient['host_prs']:.2f}.")
             strain = patient.get("assigned_hpv_strain")
             if strain:
                 carc = patient.get("strain_carcinogenicity")
-                line = f"  **Viral** — {strain}"
+                line = f"  Viral: {strain}"
                 if carc is not None:
-                    line += f" · carcinogenicity {carc}"
-                st.markdown(line)
+                    line += f", carcinogenicity {carc}"
+                st.markdown(line + ".")
 
         with col_risk:
             render_tier_badge(tier, proba)
@@ -458,22 +488,22 @@ with tab_predict:
                 "moderate": "Expedited follow-up; repeat cytology in 6 months.",
                 "high":     "Refer for diagnostic biopsy.",
             }[tier]
-            st.markdown(f"<div style='text-align:center;margin-top:8px;"
-                        f"font-weight:600;'>{rec}</div>",
+            st.markdown(f"<div style='margin-top:10px;font-size:0.9em;"
+                        f"opacity:0.85;'>{rec}</div>",
                         unsafe_allow_html=True)
 
         st.divider()
         st.subheader("Feature contributions")
         st.caption(
-            "Top features pushing this prediction toward HIGH (magenta, ↑) or "
-            "LOW (navy, ↓) risk. Computed via XGBoost built-in TreeSHAP."
+            "Top features pushing this prediction toward higher (magenta) or "
+            "lower (navy) risk. Computed via XGBoost built-in TreeSHAP."
         )
         contributors = compute_shap(model, df, top_k=10)
         if contributors and "error" not in contributors[0]:
             max_abs = max(abs(c["contribution"]) for c in contributors)
             for i, c in enumerate(contributors, 1):
                 color = BRAND_MAGENTA_BAR if c["direction"] == "up" else BRAND_NAVY_BAR
-                arrow = "↑" if c["direction"] == "up" else "↓"
+                arrow = "+" if c["direction"] == "up" else "−"
                 width = abs(c["contribution"]) / max_abs * 100
                 raw_val = resolve_raw_value(c["name"], patient)
                 st.markdown(f"""
@@ -481,7 +511,7 @@ with tab_predict:
                                  grid-template-columns:28px 220px 1fr 110px 90px;
                                  align-items:center;font-family:sans-serif;
                                  font-size:0.9em;padding:5px 0;
-                                 border-bottom:1px solid rgba(128,128,128,0.15);">
+                                 border-bottom:1px solid {BRAND_LINE};">
                         <div style="color:var(--text-color);opacity:0.5;">#{i}</div>
                         <div style="color:var(--text-color);font-weight:500;">{c['name']}</div>
                         <div style="background:rgba(128,128,128,0.18);
@@ -495,7 +525,9 @@ with tab_predict:
                             input: <b style="opacity:1.0;">{raw_val}</b>
                         </div>
                         <div style="color:{color};text-align:right;
-                                     font-weight:700;">{arrow} {c['contribution']:+.3f}</div>
+                                     font-weight:600;font-variant-numeric:tabular-nums;">
+                            {arrow}{abs(c['contribution']):.3f}
+                        </div>
                     </div>
                 """, unsafe_allow_html=True)
         else:
@@ -519,21 +551,22 @@ with tab_predict:
 
 
 # ============================================================================
-# Tab 2: DRIFT DETECTION — LIVE NCBI FEED
+# Tab 2: DRIFT DETECTION (live NCBI)
 # ============================================================================
 with tab_drift:
-    st.subheader("Drift detection — live NCBI feed")
+    st.subheader("Drift detection")
     st.markdown(
-        "This tab pulls **recent HPV sequence deposits directly from NCBI** "
-        "and computes drift against the published **de Sanjosé 2010** "
-        "prevalence prior using PSI (Population Stability Index). "
-        "Results are cached for 5 minutes to be polite to the NCBI Entrez API."
+        "This tab pulls recent HPV sequence deposits directly from the "
+        "**NCBI Entrez API** and computes drift against the published "
+        "**de Sanjose 2010** cervical-cancer prevalence prior using "
+        "PSI (Population Stability Index). "
+        "Results are cached for 5 minutes."
     )
 
     col_btn, col_n = st.columns([2, 1])
     with col_btn:
         run_check = st.button(
-            "🔄 Run live drift check now",
+            "Run live drift check",
             type="primary",
             use_container_width=True,
         )
@@ -542,7 +575,7 @@ with tab_drift:
             "Records to fetch",
             options=[100, 200, 500],
             index=1,
-            help="NCBI fetch size. Larger = more accurate, slower.",
+            help="NCBI fetch size. Larger is more accurate but slower.",
         )
 
     if run_check:
@@ -551,7 +584,7 @@ with tab_drift:
                 counts, meta = fetch_live_ncbi_strain_counts(n_records=n_records)
             except Exception as e:
                 st.error(
-                    f"**NCBI fetch failed:** `{type(e).__name__}: {e}`. "
+                    f"NCBI fetch failed: `{type(e).__name__}: {e}`. "
                     "Possible causes: NCBI rate limit, network issue, or "
                     "Biopython not installed. Try again in a minute."
                 )
@@ -560,35 +593,16 @@ with tab_drift:
         if not counts:
             st.warning(
                 "NCBI returned records but none could be typed by the strain "
-                "parser. This is unusual — try again, possibly with a larger "
-                "fetch size."
+                "parser. This is unusual; try again with a larger fetch size."
             )
             st.stop()
 
-        # Compute drift
         psi = compute_psi(counts, DE_SANJOSE_2010_PRIOR)
         severity, recommendation, color = severity_for_psi(psi)
 
-        # --- Result card --------------------------------------------------
-        st.markdown(f"""
-            <div style="background:{color};color:white;padding:20px;
-                         border-radius:12px;font-family:sans-serif;margin:16px 0;">
-                <div style="opacity:0.9;font-size:0.95em;letter-spacing:0.1em;">
-                    PSI &nbsp;·&nbsp; OBSERVED VS DE SANJOSÉ 2010 PRIOR
-                </div>
-                <div style="font-size:3em;font-weight:700;line-height:1.1;
-                             margin-top:4px;">
-                    {psi:.3f}
-                </div>
-                <div style="font-size:1.1em;margin-top:6px;letter-spacing:0.05em;">
-                    Severity: <b>{severity.upper()}</b>
-                    &nbsp; · &nbsp; {recommendation}
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
+        render_psi_card(psi, severity, recommendation, color)
 
-        # --- Side-by-side distribution table -----------------------------
-        st.subheader("Strain distribution — observed vs prior")
+        st.subheader("Strain distribution: observed vs prior")
         n_total = sum(counts.values()) or 1
         rows = []
         for strain in sorted(set(counts) | set(DE_SANJOSE_2010_PRIOR)):
@@ -604,24 +618,21 @@ with tab_drift:
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # --- Meta info ----------------------------------------------------
         with st.expander("Fetch metadata"):
             st.json(meta)
 
-        # --- Interpretation ----------------------------------------------
-        st.markdown("---")
         st.markdown("##### Interpretation")
         if severity == "significant":
             st.markdown(
-                "**The deposit composition deviates significantly from the "
-                "published cervical-cancer prior.** Possible reasons:\n"
-                "- Real epidemiological shift (e.g. post-vaccination strain "
-                "replacement, expected by ~2035)\n"
-                "- **Research deposition bias** — NCBI is dominated by "
-                "sequencing studies, not population epidemiology. HPV16 is "
-                "over-represented relative to its true prevalence. *This is "
-                "the most likely interpretation today.*\n"
-                "- A new emerging strain reaching wider sequencing attention"
+                "The deposit composition deviates significantly from the "
+                "published cervical-cancer prior. Possible reasons:\n\n"
+                "- Real epidemiological shift, e.g. post-vaccination strain "
+                "replacement (expected by approximately 2035).\n"
+                "- Research-deposition bias. NCBI is dominated by sequencing "
+                "studies, not population epidemiology. HPV16 is over-"
+                "represented relative to its true prevalence. This is the "
+                "most likely interpretation today.\n"
+                "- A new emerging strain reaching wider sequencing attention."
             )
         elif severity == "minor":
             st.markdown(
@@ -630,26 +641,24 @@ with tab_drift:
             )
         else:
             st.markdown(
-                "No meaningful drift. The current NCBI deposit composition is "
-                "consistent with the de Sanjosé 2010 prior."
+                "No meaningful drift. The current NCBI deposit composition "
+                "is consistent with the de Sanjose 2010 prior."
             )
-
     else:
         st.info(
-            "Click **Run live drift check now** to pull current HPV deposits "
+            "Click **Run live drift check** to pull current HPV deposits "
             "from NCBI and compute drift against the published prior. "
-            "Result cached for 5 minutes."
+            "Result is cached for 5 minutes."
         )
 
-    # --- Reference material (collapsed) ----------------------------------
-    with st.expander("📊 Methods reference — three statistical tests"):
+    with st.expander("Methods reference: three statistical tests"):
         st.dataframe(pd.DataFrame([
             {"Method": "PSI",
              "Detects":   "Categorical shift (strain composition, ancestry)",
-             "Threshold": "< 0.10 none · 0.10–0.20 minor · ≥ 0.20 significant"},
+             "Threshold": "< 0.10 none, 0.10–0.20 minor, ≥ 0.20 significant"},
             {"Method": "KS 2-sample",
              "Detects":   "Continuous shift (age, PRS, smoking years)",
-             "Threshold": "D ≥ 0.10 OR p < 0.05"},
+             "Threshold": "D ≥ 0.10 or p < 0.05"},
             {"Method": "Chi-square",
              "Detects":   "Observed counts vs published prior",
              "Threshold": "p < 0.05"},
@@ -659,11 +668,11 @@ with tab_drift:
             "are used by the full pipeline on continuous and count-based features."
         )
 
-    with st.expander("📈 Forward-time vaccination simulation (Drolet 2019 calibration)"):
+    with st.expander("Forward-time vaccination simulation (Drolet 2019 calibration)"):
         st.caption(
             "How the detector would respond if HPV vaccination drives the "
-            "expected strain replacement over 20 years (calibrated to Drolet "
-            "et al. *Lancet* 2019, pooled meta-analysis of 65 studies)."
+            "expected strain replacement over 20 years (calibrated to "
+            "Drolet et al. Lancet 2019, pooled meta-analysis of 65 studies)."
         )
         st.dataframe(pd.DataFrame([
             {"Time": "Baseline", "HPV16 share": "55.0%", "PSI": 0.000,
@@ -673,14 +682,14 @@ with tab_drift:
             {"Time": "Year 10",  "HPV16 share": "42.1%", "PSI": 0.156,
              "Severity": "minor",       "Recommended": "monitor"},
             {"Time": "Year 15",  "HPV16 share": "35.9%", "PSI": 0.330,
-             "Severity": "significant", "Recommended": "RETRAIN"},
+             "Severity": "significant", "Recommended": "retrain"},
             {"Time": "Year 20",  "HPV16 share": "31.2%", "PSI": 0.495,
-             "Severity": "significant", "Recommended": "RETRAIN"},
+             "Severity": "significant", "Recommended": "retrain"},
         ]), use_container_width=True, hide_index=True)
 
     baseline = load_baseline()
     if baseline:
-        with st.expander("🗂️ Saved drift baseline (training-time statistics)"):
+        with st.expander("Saved drift baseline (training-time statistics)"):
             st.json(baseline)
 
 
@@ -692,12 +701,13 @@ with tab_about:
     st.markdown(
         "**CerviRisk-MM** is a research prototype multi-modal cervical "
         "cancer risk prediction pipeline. This demo runs the deployed model "
-        "and the live NCBI drift check. The full pipeline (FastAPI service, "
-        "auto-refreshing dashboard, 53 automated tests, Docker deployment, "
-        "GitHub Actions CI) is available in the source repository."
+        "and the live NCBI drift check. The full pipeline, including the "
+        "FastAPI service, auto-refreshing dashboard, 53 automated tests, "
+        "Docker deployment, and GitHub Actions CI, is available in the "
+        "source repository."
     )
 
-    st.subheader("Deployed model — performance")
+    st.subheader("Deployed model: performance")
     st.caption(f"Variant: `{DEPLOYED_METRICS['variant']}`")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("DEV AUPRC",   f"{DEPLOYED_METRICS['dev']['auprc']}%")
@@ -717,31 +727,31 @@ with tab_about:
             f"- **AUROC** {test['auroc'][0]}% ± {test['auroc'][1]}%\n"
             f"- **Sensitivity** {test['sensitivity'][0]}% ± {test['sensitivity'][1]}%\n"
             f"- **Specificity** {test['specificity'][0]}% ± {test['specificity'][1]}%\n\n"
-            f"n = {test['n']} held-out patients · {test['positives']} biopsy-positive · "
-            f"wide standard deviations reflect ~2 positives per 5-fold chunk."
+            f"n = {test['n']} held-out patients, {test['positives']} biopsy-positive. "
+            f"Wide standard deviations reflect approximately 2 positives per 5-fold chunk."
         )
 
     st.subheader("Honest limitations")
     st.markdown(
         "- **Small training cohort** (n = 858 from a single Venezuelan clinic). "
         "Geographic generalization is not validated.\n"
-        "- **The deployed model is `triage + xgb`** — a referral decision-support "
+        "- **The deployed model is `triage + xgb`**, a referral decision-support "
         "tool that assumes prior screening tests exist (Hinselmann, Schiller, "
         "cytology). It is not a primary screening tool.\n"
-        "- **The host PRS is `BIOLOGICALLY_INFORMED_SYNTHETIC`** — real GWAS "
+        "- **The host PRS is `BIOLOGICALLY_INFORMED_SYNTHETIC`**: real GWAS "
         "biology, but per-individual genotypes are sampled from population "
         "allele frequencies, not from real VCFs.\n"
         "- **Augmentation did not improve over UCI-only features** on this "
-        "cohort — reported honestly because the architecture is the deliverable, "
-        "not the metric."
+        "cohort, reported honestly because the architecture is the "
+        "deliverable, not the metric."
     )
 
     st.subheader("Source")
-    st.markdown("- **GitHub:** https://github.com/nibrasissa/cervirisk-mm")
-    st.markdown("- **License:** MIT")
+    st.markdown("- GitHub: https://github.com/nibrasissa/cervirisk-mm")
+    st.markdown("- License: MIT")
 
 st.divider()
 st.caption(
-    f"Generated at {datetime.utcnow().isoformat(timespec='seconds')} UTC · "
-    "research prototype — not a medical device."
+    f"Generated at {datetime.utcnow().isoformat(timespec='seconds')} UTC. "
+    "Research prototype, not a medical device."
 )
