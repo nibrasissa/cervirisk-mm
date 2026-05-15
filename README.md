@@ -42,7 +42,7 @@ The repo is designed so any reviewer can run `docker compose up` and have a work
                                                 └──────────────────┘
 ```
 
-The four sources are independent: there is no public dataset linking host genotype, HPV strain, and clinical outcome for the same patient. CerviRisk-MM solves this with **explicit assembly** rather than fake record joins — real biopsy outcomes from UCI are anchor points; strain assignments, host PRS, and ancestry matching are augmentations sampled from published priors with provenance tags. The data integrity contract is enforced by `src/storage/provenance.py` and verified by `tests/test_no_leakage.py`.
+The four sources are independent: there is no public dataset linking host genotype, HPV strain, and clinical outcome for the same patient. CerviRisk-MM solves this with **explicit assembly** rather than fake record joins. The real biopsy outcomes from UCI are anchor points; strain assignments, host PRS, and ancestry matching are augmentations sampled from published priors with provenance tags. The data integrity contract is enforced by `src/storage/provenance.py` and verified by `tests/test_no_leakage.py`.
 
 ---
 
@@ -115,10 +115,10 @@ The integrity contract: **biopsy outcomes are never overwritten by augmentation*
 
 | Model | Why |
 |---|---|
-| `logreg` | Class-balanced logistic regression — interpretable baseline |
-| `logreg_cal` | Same with isotonic calibration — better-calibrated probabilities |
+| `logreg` | Class-balanced logistic regression, interpretable baseline |
+| `logreg_cal` | Same with isotonic calibration, better-calibrated probabilities |
 | `rf` | Random forest, class-balanced — non-linear baseline |
-| `balanced_rf` | Balanced Random Forest from `imbalanced-learn` — undersamples per tree |
+| `balanced_rf` | Balanced Random Forest from `imbalanced-learn` undersamples per tree |
 | `gbm` | sklearn GradientBoosting with per-sample balanced weights |
 | `xgb` | XGBoost — tuned regularization for small-data regime |
 
@@ -167,7 +167,7 @@ The wide test-set standard deviations (especially ±26.6% on AUPRC) reflect the 
 **Negative results reported honestly:**
 
 - **Augmentation does not improve over UCI alone.** Strain assignment reaches only 18 of 858 patients (2.1%) because UCI's HPV reporting is sparse, and the host PRS is a placeholder. The pipeline architecture accepts real strain genotyping from clinical sources unchanged — but on UCI, augmentation has no measurable effect.
-- **IterativeImputer does not improve over SimpleImputer (median).** Tested as a methodological alternative — DEV AUPRC differs by <1 percentage point across all six algorithms. The columns with substantial NaN are also the least predictive ones, so no imputer can extract signal that isn't there.
+- **IterativeImputer does not improve over SimpleImputer (median).** Tested as a methodological alternative DEV AUPRC differs by <1 percentage point across all six algorithms. The columns with substantial NaN are also the least predictive ones, so no imputer can extract signal that isn't there.
 
 These negative findings are documented for transparency.
 
