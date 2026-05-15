@@ -1,14 +1,16 @@
 """CerviRisk-MM — Streamlit Community Cloud deployment.
 
-Self-contained: loads the trained model directly with joblib. No FastAPI
-process needed alongside. The full version with live NCBI drift monitoring
-lives in frontend/app.py and is launched locally via `.\\run.ps1 ui`.
+Self-contained: loads the trained model directly with joblib, AND fetches
+live HPV strain composition from NCBI E-utilities to compute drift against
+the published de Sanjosé 2010 prior. No separate FastAPI process needed.
 
 Live: https://cervirisk-mm.streamlit.app/
 """
 from __future__ import annotations
 
 import json
+import math
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -44,9 +46,7 @@ DISCLAIMER = (
     "regulatory approval and clinical validation."
 )
 
-# Deployed model metrics — these are part of the frozen v0.1 artifact,
-# hardcoded for reliable display (the JSON format may differ from training run
-# to training run; the cloud demo serves a fixed model with fixed numbers).
+# Deployed model — frozen v0.1 metrics
 DEPLOYED_METRICS = {
     "variant": "triage + xgb (tuned)",
     "dev": {
@@ -59,6 +59,19 @@ DEPLOYED_METRICS = {
         "sensitivity": (80.0, 40.0), "specificity": (96.3, 2.3),
         "n": 172, "positives": 11,
     },
+}
+
+# Published prior — de Sanjosé et al. Lancet Oncology 11(11):1048 (2010)
+# Pooled analysis of HPV type distribution in invasive cervical cancer.
+DE_SANJOSE_2010_PRIOR = {
+    "HPV16":  0.55,
+    "HPV18":  0.15,
+    "HPV31":  0.05,
+    "HPV33":  0.05,
+    "HPV45":  0.04,
+    "HPV52":  0.03,
+    "HPV58":  0.03,
+    "OTHER":  0.10,
 }
 
 ALL_FEATURES = [
@@ -129,7 +142,90 @@ def load_baseline() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline helpers
+# LIVE NCBI DRIFT — inlined so no FastAPI process needed
+# ---------------------------------------------------------------------------
+HPV_TYPE_RE = re.compile(r"(?:type|HPV[-\s]?)(\d{1,3})", re.IGNORECASE)
+KNOWN_HR_TYPES = {"HPV16", "HPV18", "HPV31", "HPV33", "HPV45", "HPV52", "HPV58"}
+
+
+@st.cache_data(ttl=300, show_spinner=False)  # 5-min cache like the FastAPI version
+def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
+    """Pull recent HPV deposits from NCBI and aggregate by type.
+
+    Returns (counts, meta) where counts maps strain → integer and meta
+    contains diagnostic info (timestamp, total records inspected, etc.).
+    """
+    from Bio import Entrez
+    Entrez.email = "cervirisk-demo@streamlit.app"   # NCBI etiquette: identify yourself
+
+    started = datetime.utcnow()
+
+    # esearch — find recent HPV nucleotide records
+    h = Entrez.esearch(
+        db="nucleotide",
+        term="human papillomavirus[Organism]",
+        retmax=n_records,
+        sort="pub_date",
+    )
+    res = Entrez.read(h)
+    h.close()
+    ids = res.get("IdList", [])
+
+    if not ids:
+        return {}, {"started": started.isoformat(), "n_records": 0,
+                     "n_typed": 0, "source": "NCBI nucleotide (live)"}
+
+    # esummary — get titles in one batch
+    h = Entrez.esummary(db="nucleotide", id=",".join(ids))
+    summaries = Entrez.read(h)
+    h.close()
+
+    counts: dict[str, int] = {}
+    n_typed = 0
+    for s in summaries:
+        title = str(s.get("Title", ""))
+        m = HPV_TYPE_RE.search(title)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if n > 200:                    # sanity guard against parser false positives
+            continue
+        key = f"HPV{n}" if f"HPV{n}" in KNOWN_HR_TYPES else "OTHER"
+        counts[key] = counts.get(key, 0) + 1
+        n_typed += 1
+
+    meta = {
+        "started":   started.isoformat(timespec="seconds") + "Z",
+        "n_records": len(ids),
+        "n_typed":   n_typed,
+        "source":    "NCBI nucleotide via Entrez (live, on-demand)",
+    }
+    return counts, meta
+
+
+def compute_psi(observed: dict, expected: dict, epsilon: float = 1e-6) -> float:
+    """Population Stability Index — categorical drift score."""
+    keys = set(observed) | set(expected)
+    total = sum(observed.values()) or 1
+    psi = 0.0
+    for k in keys:
+        p_obs = max(observed.get(k, 0) / total, epsilon)
+        p_exp = max(expected.get(k, 0),         epsilon)
+        psi += (p_obs - p_exp) * math.log(p_obs / p_exp)
+    return psi
+
+
+def severity_for_psi(psi: float) -> tuple[str, str, str]:
+    """Return (severity, recommendation, color)."""
+    if psi < 0.10:
+        return "none",        "No action required.",           BRAND_NAVY
+    if psi < 0.20:
+        return "minor",       "Monitor — investigate causes.", BRAND_AMBER
+    return     "significant", "RETRAIN recommended.",          BRAND_MAGENTA
+
+
+# ---------------------------------------------------------------------------
+# Pipeline helpers (prediction)
 # ---------------------------------------------------------------------------
 def features_to_row(patient: dict) -> pd.DataFrame:
     return pd.DataFrame([{f: patient.get(f, None) for f in ALL_FEATURES}])
@@ -314,7 +410,7 @@ st.caption(
 )
 
 tab_predict, tab_drift, tab_about = st.tabs(
-    ["Predict", "Drift detection", "About this model"]
+    ["Predict", "Drift detection (live)", "About this model"]
 )
 
 # ============================================================================
@@ -423,72 +519,168 @@ with tab_predict:
 
 
 # ============================================================================
-# Tab 2: DRIFT DETECTION
+# Tab 2: DRIFT DETECTION — LIVE NCBI FEED
 # ============================================================================
 with tab_drift:
-    st.subheader("Drift detection — overview")
+    st.subheader("Drift detection — live NCBI feed")
     st.markdown(
-        "CerviRisk-MM watches its own input distributions with three "
-        "statistical tests. The full version (Docker / local clone) pulls "
-        "live NCBI deposits and refreshes every minute. **This cloud demo "
-        "shows a static demonstration** of how the detector responds to a "
-        "calibrated post-vaccination scenario."
+        "This tab pulls **recent HPV sequence deposits directly from NCBI** "
+        "and computes drift against the published **de Sanjosé 2010** "
+        "prevalence prior using PSI (Population Stability Index). "
+        "Results are cached for 5 minutes to be polite to the NCBI Entrez API."
     )
 
-    st.subheader("Statistical tests")
-    drift_methods = pd.DataFrame([
-        {"Method": "PSI",
-         "Detects":   "Categorical shift (strain composition, ancestry)",
-         "Threshold": "< 0.10 none · 0.10–0.20 minor · ≥ 0.20 significant"},
-        {"Method": "KS 2-sample",
-         "Detects":   "Continuous shift (age, PRS, smoking years)",
-         "Threshold": "D ≥ 0.10 OR p < 0.05"},
-        {"Method": "Chi-square",
-         "Detects":   "Observed counts vs published prior",
-         "Threshold": "p < 0.05"},
-    ])
-    st.dataframe(drift_methods, use_container_width=True, hide_index=True)
+    col_btn, col_n = st.columns([2, 1])
+    with col_btn:
+        run_check = st.button(
+            "🔄 Run live drift check now",
+            type="primary",
+            use_container_width=True,
+        )
+    with col_n:
+        n_records = st.selectbox(
+            "Records to fetch",
+            options=[100, 200, 500],
+            index=1,
+            help="NCBI fetch size. Larger = more accurate, slower.",
+        )
 
-    st.subheader("Forward-time vaccination simulation")
-    st.caption(
-        "Calibrated to Drolet et al. *Lancet* 2019 — pooled meta-analysis of "
-        "65 studies and 60 million person-years. HPV16 down 80%, HPV18 down "
-        "83%, HPV31/33/45 cross-protection 55–65%, plateau at year 13."
-    )
-    drift_sim = pd.DataFrame([
-        {"Time": "Baseline", "HPV16 share": "55.0%", "PSI": 0.000,
-         "Severity": "none",        "Recommended": "—"},
-        {"Time": "Year 5",   "HPV16 share": "50.7%", "PSI": 0.020,
-         "Severity": "none",        "Recommended": "no action"},
-        {"Time": "Year 10",  "HPV16 share": "42.1%", "PSI": 0.156,
-         "Severity": "minor",       "Recommended": "monitor"},
-        {"Time": "Year 15",  "HPV16 share": "35.9%", "PSI": 0.330,
-         "Severity": "significant", "Recommended": "RETRAIN"},
-        {"Time": "Year 20",  "HPV16 share": "31.2%", "PSI": 0.495,
-         "Severity": "significant", "Recommended": "RETRAIN"},
-    ])
-    st.dataframe(drift_sim, use_container_width=True, hide_index=True)
+    if run_check:
+        with st.spinner("Fetching live HPV deposits from NCBI..."):
+            try:
+                counts, meta = fetch_live_ncbi_strain_counts(n_records=n_records)
+            except Exception as e:
+                st.error(
+                    f"**NCBI fetch failed:** `{type(e).__name__}: {e}`. "
+                    "Possible causes: NCBI rate limit, network issue, or "
+                    "Biopython not installed. Try again in a minute."
+                )
+                st.stop()
 
-    st.markdown(
-        "The detector stays **silent during natural variation** (years 0–5), "
-        "raises a **graduated warning** as drift accumulates (year 10 → "
-        "minor), and crosses the **retrain threshold** at the realistic "
-        "15–20 year horizon predicted by the Drolet meta-analysis."
-    )
+        if not counts:
+            st.warning(
+                "NCBI returned records but none could be typed by the strain "
+                "parser. This is unusual — try again, possibly with a larger "
+                "fetch size."
+            )
+            st.stop()
 
-    st.subheader("Real-world finding")
-    st.info(
-        "When the same detector is applied to **live NCBI HPV deposits vs "
-        "the de Sanjosé 2010 published prevalence prior**, it returns "
-        "**PSI = 1.68** — significant drift. This is not a population "
-        "shift; it is **research-deposition bias** (HPV16 is over-"
-        "represented in NCBI sequencing studies). The detector correctly "
-        "surfaces it as a data-quality signal."
-    )
+        # Compute drift
+        psi = compute_psi(counts, DE_SANJOSE_2010_PRIOR)
+        severity, recommendation, color = severity_for_psi(psi)
+
+        # --- Result card --------------------------------------------------
+        st.markdown(f"""
+            <div style="background:{color};color:white;padding:20px;
+                         border-radius:12px;font-family:sans-serif;margin:16px 0;">
+                <div style="opacity:0.9;font-size:0.95em;letter-spacing:0.1em;">
+                    PSI &nbsp;·&nbsp; OBSERVED VS DE SANJOSÉ 2010 PRIOR
+                </div>
+                <div style="font-size:3em;font-weight:700;line-height:1.1;
+                             margin-top:4px;">
+                    {psi:.3f}
+                </div>
+                <div style="font-size:1.1em;margin-top:6px;letter-spacing:0.05em;">
+                    Severity: <b>{severity.upper()}</b>
+                    &nbsp; · &nbsp; {recommendation}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # --- Side-by-side distribution table -----------------------------
+        st.subheader("Strain distribution — observed vs prior")
+        n_total = sum(counts.values()) or 1
+        rows = []
+        for strain in sorted(set(counts) | set(DE_SANJOSE_2010_PRIOR)):
+            obs_n = counts.get(strain, 0)
+            obs_pct = obs_n / n_total * 100
+            exp_pct = DE_SANJOSE_2010_PRIOR.get(strain, 0) * 100
+            rows.append({
+                "Strain":           strain,
+                "NCBI count":       obs_n,
+                "NCBI share (%)":   f"{obs_pct:5.1f}",
+                "Prior share (%)":  f"{exp_pct:5.1f}",
+                "Delta (pp)":       f"{obs_pct - exp_pct:+5.1f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # --- Meta info ----------------------------------------------------
+        with st.expander("Fetch metadata"):
+            st.json(meta)
+
+        # --- Interpretation ----------------------------------------------
+        st.markdown("---")
+        st.markdown("##### Interpretation")
+        if severity == "significant":
+            st.markdown(
+                "**The deposit composition deviates significantly from the "
+                "published cervical-cancer prior.** Possible reasons:\n"
+                "- Real epidemiological shift (e.g. post-vaccination strain "
+                "replacement, expected by ~2035)\n"
+                "- **Research deposition bias** — NCBI is dominated by "
+                "sequencing studies, not population epidemiology. HPV16 is "
+                "over-represented relative to its true prevalence. *This is "
+                "the most likely interpretation today.*\n"
+                "- A new emerging strain reaching wider sequencing attention"
+            )
+        elif severity == "minor":
+            st.markdown(
+                "Mild drift detected. Worth monitoring; not yet at the "
+                "retrain threshold."
+            )
+        else:
+            st.markdown(
+                "No meaningful drift. The current NCBI deposit composition is "
+                "consistent with the de Sanjosé 2010 prior."
+            )
+
+    else:
+        st.info(
+            "Click **Run live drift check now** to pull current HPV deposits "
+            "from NCBI and compute drift against the published prior. "
+            "Result cached for 5 minutes."
+        )
+
+    # --- Reference material (collapsed) ----------------------------------
+    with st.expander("📊 Methods reference — three statistical tests"):
+        st.dataframe(pd.DataFrame([
+            {"Method": "PSI",
+             "Detects":   "Categorical shift (strain composition, ancestry)",
+             "Threshold": "< 0.10 none · 0.10–0.20 minor · ≥ 0.20 significant"},
+            {"Method": "KS 2-sample",
+             "Detects":   "Continuous shift (age, PRS, smoking years)",
+             "Threshold": "D ≥ 0.10 OR p < 0.05"},
+            {"Method": "Chi-square",
+             "Detects":   "Observed counts vs published prior",
+             "Threshold": "p < 0.05"},
+        ]), use_container_width=True, hide_index=True)
+        st.caption(
+            "PSI is the categorical drift metric used above. KS and chi-square "
+            "are used by the full pipeline on continuous and count-based features."
+        )
+
+    with st.expander("📈 Forward-time vaccination simulation (Drolet 2019 calibration)"):
+        st.caption(
+            "How the detector would respond if HPV vaccination drives the "
+            "expected strain replacement over 20 years (calibrated to Drolet "
+            "et al. *Lancet* 2019, pooled meta-analysis of 65 studies)."
+        )
+        st.dataframe(pd.DataFrame([
+            {"Time": "Baseline", "HPV16 share": "55.0%", "PSI": 0.000,
+             "Severity": "none",        "Recommended": "—"},
+            {"Time": "Year 5",   "HPV16 share": "50.7%", "PSI": 0.020,
+             "Severity": "none",        "Recommended": "no action"},
+            {"Time": "Year 10",  "HPV16 share": "42.1%", "PSI": 0.156,
+             "Severity": "minor",       "Recommended": "monitor"},
+            {"Time": "Year 15",  "HPV16 share": "35.9%", "PSI": 0.330,
+             "Severity": "significant", "Recommended": "RETRAIN"},
+            {"Time": "Year 20",  "HPV16 share": "31.2%", "PSI": 0.495,
+             "Severity": "significant", "Recommended": "RETRAIN"},
+        ]), use_container_width=True, hide_index=True)
 
     baseline = load_baseline()
     if baseline:
-        with st.expander("Saved drift baseline (training-time statistics)"):
+        with st.expander("🗂️ Saved drift baseline (training-time statistics)"):
             st.json(baseline)
 
 
@@ -500,9 +692,9 @@ with tab_about:
     st.markdown(
         "**CerviRisk-MM** is a research prototype multi-modal cervical "
         "cancer risk prediction pipeline. This demo runs the deployed model "
-        "only — the full pipeline (FastAPI service, drift detection against "
-        "live NCBI feed, 53 automated tests, Docker deployment, GitHub "
-        "Actions CI) is available in the source repository."
+        "and the live NCBI drift check. The full pipeline (FastAPI service, "
+        "auto-refreshing dashboard, 53 automated tests, Docker deployment, "
+        "GitHub Actions CI) is available in the source repository."
     )
 
     st.subheader("Deployed model — performance")
