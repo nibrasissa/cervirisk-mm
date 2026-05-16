@@ -43,6 +43,8 @@ cd cervirisk-mm
 .\run.ps1 ui           # UI on :8501 (in a second terminal)
 ```
 
+On macOS or Linux, use Docker (above) or `make quickstart && make serve && make ui` from the included `Makefile`.
+
 ---
 
 ## Architecture
@@ -85,6 +87,26 @@ Five stages, one module per stage.
 
 ---
 
+## Ingestion cadence
+
+Each data source updates at a different natural rhythm. The pipeline matches each source's cadence rather than forcing them all into the same schedule.
+
+| Source | Cadence | Why this rhythm |
+|---|---|---|
+| UCI Cervical Cancer Risk Factors | once at training time | Static published dataset (Fernandes 2017). Reingested only when retraining. |
+| 1000 Genomes allele frequencies | once at training time | Reference panel, updated by the consortium on a multi-year cycle. |
+| PGS Catalog scores | once at training time | Curated, slowly changing. |
+| NCBI HPV deposits | **hourly background refresh** | New sequences arrive worldwide every day. The FastAPI service runs a background asyncio task that re-fetches every hour and updates a disk-backed cache. |
+| Retraining the model itself | **drift-triggered**, not calendar-triggered | When PSI ≥ 0.20 against the de Sanjose 2010 prior over a sustained window, the drift detector recommends retrain. |
+
+Hourly was chosen for NCBI because it is the slowest rhythm that still feels "live" to a human, any faster would be wasted (NCBI does not change second-to-second), and it stays well within NCBI's polite-use rate limits. The cache lives in memory and on disk (`data/cache/ncbi_hpv_latest.json`) so a restart picks up the last good result rather than starting cold.
+
+Implementation: `src/ingestion/ncbi_scheduler.py`. Tests: `tests/test_ncbi_scheduler.py`.
+
+The cloud demo at https://cervirisk-mm.streamlit.app/ uses a simpler on-demand 5-minute cache (one Streamlit process cannot reliably run background tasks). The Docker image and local `run.ps1 serve` versions use the full hourly scheduler.
+
+---
+
 ## Code structure
 
 Organized by pipeline layer, not by file type.
@@ -121,7 +143,7 @@ Flat files. n = 858 patients, total artifact set under 10 MB, fully regenerable 
 | Processed table | Parquet | Same |
 | Model artifact | joblib pickle | sklearn-native, full pipeline state |
 | Metrics, baseline, hyperparameters | JSON | Human-readable, git-diffable |
-| Live NCBI cache | in-memory dict | 5-minute TTL, ephemeral |
+| Live NCBI cache | in-memory dict + JSON on disk | Hourly refresh, restart-safe |
 | Reports | Markdown | Renders in GitHub |
 
 A database would make sense in three scenarios:
@@ -174,7 +196,7 @@ OpenAPI docs at `/docs`.
 | `/predict/cervical-risk` | POST | Probability, tier, audit, SHAP |
 | `/drift/baseline` | GET | Saved baseline statistics |
 | `/drift/check` | POST | Drift report on a batch |
-| `/drift/strain/live` | GET | Live NCBI drift (5-minute cache) |
+| `/drift/strain/live` | GET | Live NCBI strain composition (served from hourly cache) |
 
 ---
 
@@ -217,7 +239,7 @@ Both show the patient summary, the risk indicator, ranked SHAP feature contribut
 python -m pytest tests/ -v
 ```
 
-53 tests, all passing.
+59 tests, all passing.
 
 | File | Tests | Coverage |
 |---|---|---|
@@ -227,6 +249,7 @@ python -m pytest tests/ -v
 | `test_host_prs.py` | 7 | PRS structure, determinism |
 | `test_drift.py` | 17 | PSI, KS, chi-square |
 | `test_ncbi_live.py` | 9 | fetch, parse, cache |
+| `test_ncbi_scheduler.py` | 6 | hourly refresh, disk cache, cancellation |
 
 CI runs on every push.
 
