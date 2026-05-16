@@ -75,28 +75,6 @@ DE_SANJOSE_2010_PRIOR = {
     "OTHER":  0.10,
 }
 
-# Vaccine impact estimates — Drolet et al. Lancet 2019.
-# Pooled meta-analysis of 65 studies and 60 million person-years.
-# Reduction fraction applied with a linear ramp from year 0 to plateau year.
-DROLET_VACCINE_REDUCTION = {
-    "HPV16": 0.80,   # direct vaccine coverage
-    "HPV18": 0.83,
-    "HPV31": 0.65,   # cross-protection
-    "HPV33": 0.65,
-    "HPV45": 0.55,   # partial cross-protection
-    "HPV52": 0.00,   # not covered by current quadrivalent/bivalent
-    "HPV58": 0.00,
-    "OTHER": 0.00,
-}
-VACCINE_PLATEAU_YEAR = 13   # full effect reached by year 13
-
-# Carcinogenicity weights used at training time (kept consistent here).
-STRAIN_CARC = {
-    "HPV16": 0.95, "HPV18": 0.85,
-    "HPV31": 0.70, "HPV33": 0.70, "HPV45": 0.70,
-    "HPV52": 0.65, "HPV58": 0.65, "OTHER": 0.50,
-}
-
 ALL_FEATURES = [
     "Age", "Number of sexual partners", "First sexual intercourse",
     "Num of pregnancies", "Smokes", "Smokes (years)",
@@ -244,50 +222,106 @@ def severity_for_psi(psi: float) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Forecast helpers (forward projection of strain composition + predicted positives)
 # ---------------------------------------------------------------------------
-def forecast_strain_shares(years_out: int = 25) -> pd.DataFrame:
-    """Project HPV strain composition forward using Drolet 2019 calibration.
+@st.cache_data(ttl=900, show_spinner=False)   # 15-min cache, this is heavier than the snapshot call
+def fetch_ncbi_strain_timeseries(
+    days_back: int = 90,
+    max_records: int = 1000,
+) -> tuple[pd.DataFrame, dict]:
+    """Pull HPV deposits from NCBI for the last `days_back` days, grouped by
+    week. Returns weekly strain shares so each row sums to 1.
 
-    Each strain declines at its reduction rate, with a linear ramp from year 0
-    to VACCINE_PLATEAU_YEAR. Shares are renormalized each year so they sum to 1.
-    Returns one column per strain plus a `year` column.
+    Output DataFrame: index = ISO week start, one column per strain.
     """
+    from Bio import Entrez
+    from datetime import date, datetime, timedelta
+
+    Entrez.email = "cervirisk-demo@streamlit.app"
+
+    today = datetime.utcnow().date()
+    start_date = today - timedelta(days=days_back)
+    started = datetime.utcnow()
+
+    # esearch with date filter + history (cleaner for larger batches)
+    h = Entrez.esearch(
+        db="nucleotide",
+        term="human papillomavirus[Organism]",
+        mindate=start_date.strftime("%Y/%m/%d"),
+        maxdate=today.strftime("%Y/%m/%d"),
+        datetype="pdat",
+        retmax=max_records,
+        sort="pub_date",
+        usehistory="y",
+    )
+    res = Entrez.read(h)
+    h.close()
+    ids = res.get("IdList", [])
+
+    meta = {
+        "started":     started.isoformat(timespec="seconds") + "Z",
+        "days_back":   days_back,
+        "date_window": f"{start_date} to {today}",
+        "n_returned":  len(ids),
+        "n_typed":     0,
+        "source":      "NCBI nucleotide via Entrez (live, weekly bucketed)",
+    }
+
+    if not ids:
+        return pd.DataFrame(), meta
+
+    h = Entrez.esummary(
+        db="nucleotide",
+        WebEnv=res["WebEnv"],
+        query_key=res["QueryKey"],
+        retmax=max_records,
+    )
+    summaries = Entrez.read(h)
+    h.close()
+
     rows = []
-    for year in range(years_out + 1):
-        ramp = min(year / VACCINE_PLATEAU_YEAR, 1.0)
-        projected = {}
-        for strain, base_share in DE_SANJOSE_2010_PRIOR.items():
-            r = DROLET_VACCINE_REDUCTION.get(strain, 0.0)
-            projected[strain] = base_share * (1.0 - r * ramp)
-        total = sum(projected.values()) or 1.0
-        row = {"year": year}
-        for s, v in projected.items():
-            row[s] = v / total
-        rows.append(row)
-    return pd.DataFrame(rows)
+    for s in summaries:
+        title = str(s.get("Title", ""))
+        m = HPV_TYPE_RE.search(title)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if n > 200:
+            continue
+        strain = f"HPV{n}" if f"HPV{n}" in KNOWN_HR_TYPES else "OTHER"
 
+        # Pub date can be "YYYY/MM/DD", "YYYY/MM", "YYYY", or "YYYY MonthName DD"
+        pub_date_str = str(s.get("PubDate") or s.get("CreateDate") or "").strip()
+        parsed = None
+        for fmt in ("%Y/%m/%d", "%Y/%m", "%Y", "%Y %b %d", "%Y %b"):
+            try:
+                parsed = datetime.strptime(pub_date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            continue
+        rows.append({"date": parsed, "strain": strain})
 
-def forecast_carcinogenicity_score(
-    strain_forecast_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Population-weighted carcinogenicity score over time.
+    meta["n_typed"] = len(rows)
 
-    At each year:
-        score(year) = sum_over_strains( share(strain, year) * carcinogenicity(strain) )
+    if not rows:
+        return pd.DataFrame(), meta
 
-    Carcinogenicity weights come from the training-time strain table
-    (HPV16=0.95, HPV18=0.85, others lower). The score falls as
-    high-carcinogenicity strains (HPV16, HPV18) are suppressed by
-    vaccination and replaced by less dangerous strains. This is the
-    biological risk burden of the strain mix.
-    """
-    rows = []
-    for _, row in strain_forecast_df.iterrows():
-        score = sum(row[s] * STRAIN_CARC[s] for s in DE_SANJOSE_2010_PRIOR)
-        rows.append({
-            "year": int(row["year"]),
-            "Population-weighted carcinogenicity": round(score, 4),
-        })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Bucket by ISO week so the chart has roughly weekly granularity
+    df["week"] = pd.to_datetime(df["date"]).dt.to_period("W").dt.start_time
+    counts = df.groupby(["week", "strain"]).size().unstack(fill_value=0)
+
+    # Ensure every known strain has a column for a stable legend
+    for s in list(KNOWN_HR_TYPES) + ["OTHER"]:
+        if s not in counts.columns:
+            counts[s] = 0
+    # Stable column order
+    counts = counts[sorted(KNOWN_HR_TYPES) + ["OTHER"]]
+
+    totals = counts.sum(axis=1).replace(0, 1)
+    shares = counts.div(totals, axis=0)
+
+    return shares, meta
 
 
 # ---------------------------------------------------------------------------
@@ -664,22 +698,6 @@ with tab_drift:
 
         render_psi_card(psi, severity, recommendation, color)
 
-        st.subheader("Strain distribution: observed vs prior")
-        n_total = sum(counts.values()) or 1
-        rows = []
-        for strain in sorted(set(counts) | set(DE_SANJOSE_2010_PRIOR)):
-            obs_n = counts.get(strain, 0)
-            obs_pct = obs_n / n_total * 100
-            exp_pct = DE_SANJOSE_2010_PRIOR.get(strain, 0) * 100
-            rows.append({
-                "Strain":           strain,
-                "NCBI count":       obs_n,
-                "NCBI share (%)":   f"{obs_pct:5.1f}",
-                "Prior share (%)":  f"{exp_pct:5.1f}",
-                "Delta (pp)":       f"{obs_pct - exp_pct:+5.1f}",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
         with st.expander("Fetch metadata"):
             st.json(meta)
 
@@ -712,6 +730,58 @@ with tab_drift:
             "use Refresh now to try again."
         )
 
+    st.divider()
+    st.subheader("Live strain composition over time")
+    st.markdown(
+        "Each line is the weekly share of one HPV strain in NCBI deposits "
+        "over the last 90 days. All data is fetched live from NCBI Entrez "
+        "at the time of viewing and grouped by publication week."
+    )
+
+    col_days, col_max = st.columns([3, 1])
+    with col_days:
+        days_back = st.selectbox(
+            "Window",
+            options=[30, 60, 90, 180],
+            index=2,
+            help="How many days of NCBI deposits to include.",
+            label_visibility="collapsed",
+        )
+    with col_max:
+        if st.button("Refresh series",
+                      help="Force a fresh fetch of the time series",
+                      use_container_width=True):
+            fetch_ncbi_strain_timeseries.clear()
+            st.rerun()
+
+    try:
+        with st.spinner(f"Fetching the last {days_back} days from NCBI..."):
+            series_df, series_meta = fetch_ncbi_strain_timeseries(
+                days_back=days_back,
+                max_records=1000,
+            )
+    except Exception as e:
+        st.error(
+            f"NCBI time-series fetch failed: `{type(e).__name__}: {e}`. "
+            "This can happen with rate limits or network hiccups; retry in a moment."
+        )
+        series_df, series_meta = pd.DataFrame(), {}
+
+    if isinstance(series_df, pd.DataFrame) and not series_df.empty:
+        st.line_chart(series_df, height=350)
+        st.caption(
+            "Weekly share, one line per HPV type. Weeks with very few "
+            "typed records may look spiky. Use the window selector above "
+            "to widen the time range."
+        )
+        with st.expander("Time-series fetch metadata"):
+            st.json(series_meta)
+    else:
+        st.info(
+            "No NCBI records were returned for the selected window. "
+            "Try widening the window or use Refresh series."
+        )
+
     with st.expander("Methods reference: three statistical tests"):
         st.dataframe(pd.DataFrame([
             {"Method": "PSI",
@@ -728,50 +798,6 @@ with tab_drift:
             "PSI is the categorical drift metric used above. KS and chi-square "
             "are used by the full pipeline on continuous and count features."
         )
-
-    st.divider()
-    st.subheader("20-year forecast")
-    st.markdown(
-        "Forward projection of HPV strain composition as vaccination drives "
-        "strain replacement, calibrated to Drolet et al. *Lancet* 2019 "
-        "(pooled meta-analysis of 65 studies). The first chart shows the "
-        "strain mix over time. The second chart shows the resulting "
-        "population-weighted carcinogenicity score, which falls because the "
-        "most dangerous strains are the ones being suppressed."
-    )
-
-    forecast_df = forecast_strain_shares(years_out=25)
-
-    st.markdown("##### Strain composition over time")
-    st.line_chart(
-        forecast_df.set_index("year"),
-        height=320,
-    )
-    st.caption(
-        "Each line is one HPV type. HPV16 and HPV18 fall sharply (direct "
-        "vaccine coverage). HPV31/33/45 fall partially via cross-protection. "
-        "HPV52, HPV58 and OTHER are not covered by current vaccines and "
-        "their share grows by replacement."
-    )
-
-    st.markdown("##### Population-weighted carcinogenicity score")
-    score_df = forecast_carcinogenicity_score(forecast_df)
-    st.line_chart(
-        score_df.set_index("year"),
-        height=240,
-    )
-    st.caption(
-        "For each year, the strain shares from Chart 1 are weighted by each "
-        "strain's published carcinogenicity (HPV16 = 0.95, HPV18 = 0.85, "
-        "HPV31/33/45 = 0.70, HPV52/58 = 0.65, OTHER = 0.50) and summed. "
-        "The score represents the biological risk burden of the prevailing "
-        "strain mix. It falls because the most dangerous strains (HPV16, "
-        "HPV18) are the ones being suppressed by vaccination. The deployed "
-        "triage + xgb model relies primarily on prior screening test results "
-        "rather than strain, so it is exercised on per-patient predictions "
-        "in the Predict tab and on real-time drift monitoring above, not in "
-        "this aggregate forecast."
-    )
 
     baseline = load_baseline()
     if baseline:
