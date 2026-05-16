@@ -75,6 +75,48 @@ DE_SANJOSE_2010_PRIOR = {
     "OTHER":  0.10,
 }
 
+# Vaccine impact estimates — Drolet et al. Lancet 2019.
+# Pooled meta-analysis of 65 studies and 60 million person-years.
+# Reduction fraction applied with a linear ramp from year 0 to plateau year.
+DROLET_VACCINE_REDUCTION = {
+    "HPV16": 0.80,   # direct vaccine coverage
+    "HPV18": 0.83,
+    "HPV31": 0.65,   # cross-protection
+    "HPV33": 0.65,
+    "HPV45": 0.55,   # partial cross-protection
+    "HPV52": 0.00,   # not covered by current quadrivalent/bivalent
+    "HPV58": 0.00,
+    "OTHER": 0.00,
+}
+VACCINE_PLATEAU_YEAR = 13   # full effect reached by year 13
+
+# Carcinogenicity weights used at training time (kept consistent here).
+STRAIN_CARC = {
+    "HPV16": 0.95, "HPV18": 0.85,
+    "HPV31": 0.70, "HPV33": 0.70, "HPV45": 0.70,
+    "HPV52": 0.65, "HPV58": 0.65, "OTHER": 0.50,
+}
+
+# Model uses OTHER_HR_HPV as the category label; the prior calls it OTHER.
+STRAIN_TO_MODEL_LABEL = {
+    "HPV16": "HPV16", "HPV18": "HPV18",
+    "HPV31": "HPV31", "HPV33": "HPV33", "HPV45": "HPV45",
+    "HPV52": "HPV52", "HPV58": "HPV58",
+    "OTHER": "OTHER_HR_HPV",
+}
+
+# Representative screening patient used for forecasting predicted positives.
+# Everything except strain is held fixed so the line moves only because the
+# strain distribution moves.
+SCREENING_TEMPLATE = {
+    "Age": 40, "Number of sexual partners": 3, "First sexual intercourse": 17,
+    "Num of pregnancies": 2, "Smokes": 0, "Smokes (years)": 0,
+    "Hormonal Contraceptives": 1, "Hormonal Contraceptives (years)": 5,
+    "IUD": 0, "STDs": 1, "STDs:HPV": 1, "Dx:HPV": 1,
+    "Hinselmann": 0, "Schiller": 0, "Citology": 0,
+    "host_prs": 1.10, "matched_super_pop": "AMR",
+}
+
 ALL_FEATURES = [
     "Age", "Number of sexual partners", "First sexual intercourse",
     "Num of pregnancies", "Smokes", "Smokes (years)",
@@ -217,6 +259,77 @@ def severity_for_psi(psi: float) -> tuple[str, str, str]:
     if psi < 0.20:
         return "minor",       "Monitor; investigate causes.", BRAND_AMBER
     return     "significant", "Retrain recommended.",         BRAND_MAGENTA
+
+
+# ---------------------------------------------------------------------------
+# Forecast helpers (forward projection of strain composition + predicted positives)
+# ---------------------------------------------------------------------------
+def forecast_strain_shares(years_out: int = 25) -> pd.DataFrame:
+    """Project HPV strain composition forward using Drolet 2019 calibration.
+
+    Each strain declines at its reduction rate, with a linear ramp from year 0
+    to VACCINE_PLATEAU_YEAR. Shares are renormalized each year so they sum to 1.
+    Returns one column per strain plus a `year` column.
+    """
+    rows = []
+    for year in range(years_out + 1):
+        ramp = min(year / VACCINE_PLATEAU_YEAR, 1.0)
+        projected = {}
+        for strain, base_share in DE_SANJOSE_2010_PRIOR.items():
+            r = DROLET_VACCINE_REDUCTION.get(strain, 0.0)
+            projected[strain] = base_share * (1.0 - r * ramp)
+        total = sum(projected.values()) or 1.0
+        row = {"year": year}
+        for s, v in projected.items():
+            row[s] = v / total
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def _per_strain_predicted_risk(_model_id: str = "v0.1") -> dict[str, float]:
+    """Cached per-strain risk for a representative screening patient.
+
+    Underscore prefix on the arg makes Streamlit cache by value, not by hashing
+    the model object (which would be expensive). The model itself is loaded
+    via load_model() and is stable per process.
+    """
+    model, _ = load_model()
+    risks: dict[str, float] = {}
+    if model is None:
+        return {s: 0.0 for s in DE_SANJOSE_2010_PRIOR}
+    for strain in DE_SANJOSE_2010_PRIOR:
+        patient = SCREENING_TEMPLATE.copy()
+        patient["assigned_hpv_strain"]      = STRAIN_TO_MODEL_LABEL[strain]
+        patient["strain_carcinogenicity"]   = STRAIN_CARC[strain]
+        try:
+            df = features_to_row(patient)
+            risks[strain] = float(model.predict_proba(df)[0, 1])
+        except Exception:
+            risks[strain] = 0.0
+    return risks
+
+
+def forecast_predicted_positives(
+    strain_forecast_df: pd.DataFrame,
+    cohort_size: int = 100,
+) -> pd.DataFrame:
+    """Project expected positive biopsies per cohort as strain mix evolves.
+
+    For each year, the expected number of positives is:
+        cohort_size * sum_over_strains( strain_share(year) * P(positive | strain) )
+    The per-strain risk is computed once on a fixed screening template, so the
+    only thing that changes year-over-year is the strain composition.
+    """
+    strain_risks = _per_strain_predicted_risk()
+    rows = []
+    for _, row in strain_forecast_df.iterrows():
+        total = 0.0
+        for strain in DE_SANJOSE_2010_PRIOR:
+            total += row[strain] * strain_risks.get(strain, 0.0) * cohort_size
+        rows.append({"year": int(row["year"]),
+                      "Predicted positives per 100": round(total, 2)})
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -552,47 +665,42 @@ with tab_predict:
 with tab_drift:
     st.subheader("Drift detection")
     st.markdown(
-        "This tab pulls recent HPV sequence deposits directly from the "
-        "NCBI Entrez API and computes drift against the published "
-        "de Sanjose 2010 cervical-cancer prevalence prior using "
-        "PSI (Population Stability Index). "
-        "Results are cached for 5 minutes."
+        "Pulls recent HPV sequence deposits directly from the NCBI Entrez "
+        "API and computes drift against the published de Sanjose 2010 "
+        "cervical-cancer prevalence prior using PSI (Population Stability "
+        "Index). Refreshes automatically; results are cached for 5 minutes "
+        "to be polite to NCBI."
     )
 
-    col_btn, col_n = st.columns([2, 1])
-    with col_btn:
-        run_check = st.button(
-            "Run live drift check",
-            type="primary",
-            use_container_width=True,
-        )
+    # Sample-size control + manual refresh, both compact.
+    col_n, col_refresh = st.columns([3, 1])
     with col_n:
         n_records = st.selectbox(
             "Records to fetch",
             options=[100, 200, 500],
             index=1,
             help="NCBI fetch size. Larger is more accurate but slower.",
+            label_visibility="collapsed",
+        )
+    with col_refresh:
+        if st.button("Refresh now", use_container_width=True,
+                      help="Force a fresh NCBI fetch, bypassing the 5-minute cache."):
+            fetch_live_ncbi_strain_counts.clear()
+            st.rerun()
+
+    # Automatic fetch on every page render (cached for 5 minutes).
+    counts, meta = {}, {}
+    try:
+        with st.spinner("Fetching live HPV deposits from NCBI..."):
+            counts, meta = fetch_live_ncbi_strain_counts(n_records=n_records)
+    except Exception as e:
+        st.error(
+            f"NCBI fetch failed: `{type(e).__name__}: {e}`. "
+            "Possible causes: NCBI rate limit, network issue, or Biopython "
+            "not installed. The page will retry on the next refresh."
         )
 
-    if run_check:
-        with st.spinner("Fetching live HPV deposits from NCBI..."):
-            try:
-                counts, meta = fetch_live_ncbi_strain_counts(n_records=n_records)
-            except Exception as e:
-                st.error(
-                    f"NCBI fetch failed: `{type(e).__name__}: {e}`. "
-                    "Possible causes: NCBI rate limit, network issue, or "
-                    "Biopython not installed. Try again in a minute."
-                )
-                st.stop()
-
-        if not counts:
-            st.warning(
-                "NCBI returned records but none could be typed by the strain "
-                "parser. Try again with a larger fetch size."
-            )
-            st.stop()
-
+    if counts:
         psi = compute_psi(counts, DE_SANJOSE_2010_PRIOR)
         severity, recommendation, color = severity_for_psi(psi)
 
@@ -642,9 +750,8 @@ with tab_drift:
             )
     else:
         st.info(
-            "Click Run live drift check to pull current HPV deposits from "
-            "NCBI and compute drift against the published prior. "
-            "Result is cached for 5 minutes."
+            "No NCBI records typed yet. The fetch may still be retrying; "
+            "use Refresh now to try again."
         )
 
     with st.expander("Methods reference: three statistical tests"):
@@ -664,24 +771,45 @@ with tab_drift:
             "are used by the full pipeline on continuous and count features."
         )
 
-    with st.expander("Forward-time vaccination simulation (Drolet 2019 calibration)"):
-        st.caption(
-            "How the detector would respond if HPV vaccination drives the "
-            "expected strain replacement over 20 years (calibrated to "
-            "Drolet et al. Lancet 2019, pooled meta-analysis of 65 studies)."
-        )
-        st.dataframe(pd.DataFrame([
-            {"Time": "Baseline", "HPV16 share": "55.0%", "PSI": 0.000,
-             "Severity": "none",        "Recommended": "—"},
-            {"Time": "Year 5",   "HPV16 share": "50.7%", "PSI": 0.020,
-             "Severity": "none",        "Recommended": "no action"},
-            {"Time": "Year 10",  "HPV16 share": "42.1%", "PSI": 0.156,
-             "Severity": "minor",       "Recommended": "monitor"},
-            {"Time": "Year 15",  "HPV16 share": "35.9%", "PSI": 0.330,
-             "Severity": "significant", "Recommended": "retrain"},
-            {"Time": "Year 20",  "HPV16 share": "31.2%", "PSI": 0.495,
-             "Severity": "significant", "Recommended": "retrain"},
-        ]), use_container_width=True, hide_index=True)
+    st.divider()
+    st.subheader("20-year forecast")
+    st.markdown(
+        "Forward projection of HPV strain composition as vaccination drives "
+        "strain replacement, calibrated to Drolet et al. *Lancet* 2019 "
+        "(pooled meta-analysis of 65 studies). The first chart shows the "
+        "strain mix over time. The second chart shows what the deployed "
+        "model would predict on a representative screening cohort as that "
+        "mix evolves."
+    )
+
+    forecast_df = forecast_strain_shares(years_out=25)
+
+    st.markdown("##### Strain composition over time")
+    st.line_chart(
+        forecast_df.set_index("year"),
+        height=320,
+    )
+    st.caption(
+        "Each line is one HPV type. HPV16 and HPV18 fall sharply (direct "
+        "vaccine coverage). HPV31/33/45 fall partially via cross-protection. "
+        "HPV52, HPV58 and OTHER are not covered by current vaccines and "
+        "their share grows by replacement."
+    )
+
+    st.markdown("##### Predicted positive biopsies per 100 patients")
+    positives_df = forecast_predicted_positives(forecast_df, cohort_size=100)
+    st.line_chart(
+        positives_df.set_index("year"),
+        height=240,
+    )
+    st.caption(
+        "Model output evaluated on a representative screening patient template, "
+        "varying only the HPV strain according to the projected distribution. "
+        "As high-carcinogenicity strains (HPV16, HPV18) decline, predicted "
+        "positive biopsies fall in step. The retraining threshold from the "
+        "drift detector lines up with the years when this curve is changing "
+        "most steeply."
+    )
 
     baseline = load_baseline()
     if baseline:
