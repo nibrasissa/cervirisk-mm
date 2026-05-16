@@ -97,26 +97,6 @@ STRAIN_CARC = {
     "HPV52": 0.65, "HPV58": 0.65, "OTHER": 0.50,
 }
 
-# Model uses OTHER_HR_HPV as the category label; the prior calls it OTHER.
-STRAIN_TO_MODEL_LABEL = {
-    "HPV16": "HPV16", "HPV18": "HPV18",
-    "HPV31": "HPV31", "HPV33": "HPV33", "HPV45": "HPV45",
-    "HPV52": "HPV52", "HPV58": "HPV58",
-    "OTHER": "OTHER_HR_HPV",
-}
-
-# Representative screening patient used for forecasting predicted positives.
-# Everything except strain is held fixed so the line moves only because the
-# strain distribution moves.
-SCREENING_TEMPLATE = {
-    "Age": 40, "Number of sexual partners": 3, "First sexual intercourse": 17,
-    "Num of pregnancies": 2, "Smokes": 0, "Smokes (years)": 0,
-    "Hormonal Contraceptives": 1, "Hormonal Contraceptives (years)": 5,
-    "IUD": 0, "STDs": 1, "STDs:HPV": 1, "Dx:HPV": 1,
-    "Hinselmann": 0, "Schiller": 0, "Citology": 0,
-    "host_prs": 1.10, "matched_super_pop": "AMR",
-}
-
 ALL_FEATURES = [
     "Age", "Number of sexual partners", "First sexual intercourse",
     "Num of pregnancies", "Smokes", "Smokes (years)",
@@ -286,49 +266,27 @@ def forecast_strain_shares(years_out: int = 25) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
-def _per_strain_predicted_risk(_model_id: str = "v0.1") -> dict[str, float]:
-    """Cached per-strain risk for a representative screening patient.
-
-    Underscore prefix on the arg makes Streamlit cache by value, not by hashing
-    the model object (which would be expensive). The model itself is loaded
-    via load_model() and is stable per process.
-    """
-    model, _ = load_model()
-    risks: dict[str, float] = {}
-    if model is None:
-        return {s: 0.0 for s in DE_SANJOSE_2010_PRIOR}
-    for strain in DE_SANJOSE_2010_PRIOR:
-        patient = SCREENING_TEMPLATE.copy()
-        patient["assigned_hpv_strain"]      = STRAIN_TO_MODEL_LABEL[strain]
-        patient["strain_carcinogenicity"]   = STRAIN_CARC[strain]
-        try:
-            df = features_to_row(patient)
-            risks[strain] = float(model.predict_proba(df)[0, 1])
-        except Exception:
-            risks[strain] = 0.0
-    return risks
-
-
-def forecast_predicted_positives(
+def forecast_carcinogenicity_score(
     strain_forecast_df: pd.DataFrame,
-    cohort_size: int = 100,
 ) -> pd.DataFrame:
-    """Project expected positive biopsies per cohort as strain mix evolves.
+    """Population-weighted carcinogenicity score over time.
 
-    For each year, the expected number of positives is:
-        cohort_size * sum_over_strains( strain_share(year) * P(positive | strain) )
-    The per-strain risk is computed once on a fixed screening template, so the
-    only thing that changes year-over-year is the strain composition.
+    At each year:
+        score(year) = sum_over_strains( share(strain, year) * carcinogenicity(strain) )
+
+    Carcinogenicity weights come from the training-time strain table
+    (HPV16=0.95, HPV18=0.85, others lower). The score falls as
+    high-carcinogenicity strains (HPV16, HPV18) are suppressed by
+    vaccination and replaced by less dangerous strains. This is the
+    biological risk burden of the strain mix.
     """
-    strain_risks = _per_strain_predicted_risk()
     rows = []
     for _, row in strain_forecast_df.iterrows():
-        total = 0.0
-        for strain in DE_SANJOSE_2010_PRIOR:
-            total += row[strain] * strain_risks.get(strain, 0.0) * cohort_size
-        rows.append({"year": int(row["year"]),
-                      "Predicted positives per 100": round(total, 2)})
+        score = sum(row[s] * STRAIN_CARC[s] for s in DE_SANJOSE_2010_PRIOR)
+        rows.append({
+            "year": int(row["year"]),
+            "Population-weighted carcinogenicity": round(score, 4),
+        })
     return pd.DataFrame(rows)
 
 
@@ -777,9 +735,9 @@ with tab_drift:
         "Forward projection of HPV strain composition as vaccination drives "
         "strain replacement, calibrated to Drolet et al. *Lancet* 2019 "
         "(pooled meta-analysis of 65 studies). The first chart shows the "
-        "strain mix over time. The second chart shows what the deployed "
-        "model would predict on a representative screening cohort as that "
-        "mix evolves."
+        "strain mix over time. The second chart shows the resulting "
+        "population-weighted carcinogenicity score, which falls because the "
+        "most dangerous strains are the ones being suppressed."
     )
 
     forecast_df = forecast_strain_shares(years_out=25)
@@ -796,19 +754,23 @@ with tab_drift:
         "their share grows by replacement."
     )
 
-    st.markdown("##### Predicted positive biopsies per 100 patients")
-    positives_df = forecast_predicted_positives(forecast_df, cohort_size=100)
+    st.markdown("##### Population-weighted carcinogenicity score")
+    score_df = forecast_carcinogenicity_score(forecast_df)
     st.line_chart(
-        positives_df.set_index("year"),
+        score_df.set_index("year"),
         height=240,
     )
     st.caption(
-        "Model output evaluated on a representative screening patient template, "
-        "varying only the HPV strain according to the projected distribution. "
-        "As high-carcinogenicity strains (HPV16, HPV18) decline, predicted "
-        "positive biopsies fall in step. The retraining threshold from the "
-        "drift detector lines up with the years when this curve is changing "
-        "most steeply."
+        "For each year, the strain shares from Chart 1 are weighted by each "
+        "strain's published carcinogenicity (HPV16 = 0.95, HPV18 = 0.85, "
+        "HPV31/33/45 = 0.70, HPV52/58 = 0.65, OTHER = 0.50) and summed. "
+        "The score represents the biological risk burden of the prevailing "
+        "strain mix. It falls because the most dangerous strains (HPV16, "
+        "HPV18) are the ones being suppressed by vaccination. The deployed "
+        "triage + xgb model relies primarily on prior screening test results "
+        "rather than strain, so it is exercised on per-patient predictions "
+        "in the Predict tab and on real-time drift monitoring above, not in "
+        "this aggregate forecast."
     )
 
     baseline = load_baseline()
