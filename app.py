@@ -62,7 +62,7 @@ DEPLOYED_METRICS = {
     },
 }
 
-# Published prior — de Sanjose et al. Lancet Oncology 11(11):1048 (2010)
+# Published prior — de Sanjose et al. Lancet Oncology 11(11):1048 (2010).
 # Pooled analysis of HPV type distribution in invasive cervical cancer.
 DE_SANJOSE_2010_PRIOR = {
     "HPV16":  0.55,
@@ -151,11 +151,7 @@ KNOWN_HR_TYPES = {"HPV16", "HPV18", "HPV31", "HPV33", "HPV45", "HPV52", "HPV58"}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
-    """Pull recent HPV deposits from NCBI and aggregate by type.
-
-    Returns (counts, meta) where counts maps strain to integer and meta
-    contains diagnostic info (timestamp, total records inspected, etc.).
-    """
+    """Pull recent HPV deposits from NCBI and aggregate by type."""
     from Bio import Entrez
     Entrez.email = "cervirisk-demo@streamlit.app"
 
@@ -203,7 +199,7 @@ def fetch_live_ncbi_strain_counts(n_records: int = 200) -> tuple[dict, dict]:
 
 
 def compute_psi(observed: dict, expected: dict, epsilon: float = 1e-6) -> float:
-    """Population Stability Index — categorical drift score."""
+    """Population Stability Index."""
     keys = set(observed) | set(expected)
     total = sum(observed.values()) or 1
     psi = 0.0
@@ -295,7 +291,7 @@ def resolve_raw_value(name: str, patient: dict) -> str:
 
 
 def render_tier_badge(tier: str, prob: float) -> None:
-    """Restrained tier indicator — colored left accent rather than full background."""
+    """Subtle tier indicator with a colored left accent."""
     color = TIER_COLORS.get(tier, BRAND_MUTED)
     st.markdown(f"""
         <div style="border-left:6px solid {color};
@@ -319,7 +315,7 @@ def render_tier_badge(tier: str, prob: float) -> None:
 
 
 def render_psi_card(psi: float, severity: str, recommendation: str, color: str) -> None:
-    """Restrained PSI result — accent strip + clean metric block."""
+    """Subtle PSI result with accent strip + clean metric block."""
     st.markdown(f"""
         <div style="border-left:6px solid {color};
                      padding:14px 20px;border-radius:4px;
@@ -545,7 +541,7 @@ with tab_predict:
             })
     else:
         st.info(
-            "Configure the patient in the sidebar, then click **Run prediction**. "
+            "Configure the patient in the sidebar, then click Run prediction. "
             "Three sample profiles are available; you can also build a custom patient."
         )
 
@@ -557,8 +553,8 @@ with tab_drift:
     st.subheader("Drift detection")
     st.markdown(
         "This tab pulls recent HPV sequence deposits directly from the "
-        "**NCBI Entrez API** and computes drift against the published "
-        "**de Sanjose 2010** cervical-cancer prevalence prior using "
+        "NCBI Entrez API and computes drift against the published "
+        "de Sanjose 2010 cervical-cancer prevalence prior using "
         "PSI (Population Stability Index). "
         "Results are cached for 5 minutes."
     )
@@ -593,7 +589,7 @@ with tab_drift:
         if not counts:
             st.warning(
                 "NCBI returned records but none could be typed by the strain "
-                "parser. This is unusual; try again with a larger fetch size."
+                "parser. Try again with a larger fetch size."
             )
             st.stop()
 
@@ -626,8 +622,8 @@ with tab_drift:
             st.markdown(
                 "The deposit composition deviates significantly from the "
                 "published cervical-cancer prior. Possible reasons:\n\n"
-                "- Real epidemiological shift, e.g. post-vaccination strain "
-                "replacement (expected by approximately 2035).\n"
+                "- Real epidemiological shift, for example post-vaccination "
+                "strain replacement.\n"
                 "- Research-deposition bias. NCBI is dominated by sequencing "
                 "studies, not population epidemiology. HPV16 is over-"
                 "represented relative to its true prevalence. This is the "
@@ -646,8 +642,8 @@ with tab_drift:
             )
     else:
         st.info(
-            "Click **Run live drift check** to pull current HPV deposits "
-            "from NCBI and compute drift against the published prior. "
+            "Click Run live drift check to pull current HPV deposits from "
+            "NCBI and compute drift against the published prior. "
             "Result is cached for 5 minutes."
         )
 
@@ -665,7 +661,7 @@ with tab_drift:
         ]), use_container_width=True, hide_index=True)
         st.caption(
             "PSI is the categorical drift metric used above. KS and chi-square "
-            "are used by the full pipeline on continuous and count-based features."
+            "are used by the full pipeline on continuous and count features."
         )
 
     with st.expander("Forward-time vaccination simulation (Drolet 2019 calibration)"):
@@ -699,8 +695,8 @@ with tab_drift:
 with tab_about:
     st.subheader("About this demo")
     st.markdown(
-        "**CerviRisk-MM** is a research prototype multi-modal cervical "
-        "cancer risk prediction pipeline. This demo runs the deployed model "
+        "This is the live demo of CerviRisk-MM, a multi-modal cervical "
+        "cancer risk prediction pipeline. The demo runs the deployed model "
         "and the live NCBI drift check. The full pipeline, including the "
         "FastAPI service, auto-refreshing dashboard, 53 automated tests, "
         "Docker deployment, and GitHub Actions CI, is available in the "
@@ -723,32 +719,29 @@ with tab_about:
     with st.expander("Held-out TEST set (5-fold stratified subsampling)"):
         test = DEPLOYED_METRICS["test"]
         st.markdown(
-            f"- **AUPRC** {test['auprc'][0]}% ± {test['auprc'][1]}%\n"
-            f"- **AUROC** {test['auroc'][0]}% ± {test['auroc'][1]}%\n"
-            f"- **Sensitivity** {test['sensitivity'][0]}% ± {test['sensitivity'][1]}%\n"
-            f"- **Specificity** {test['specificity'][0]}% ± {test['specificity'][1]}%\n\n"
+            f"- AUPRC {test['auprc'][0]}% ± {test['auprc'][1]}%\n"
+            f"- AUROC {test['auroc'][0]}% ± {test['auroc'][1]}%\n"
+            f"- Sensitivity {test['sensitivity'][0]}% ± {test['sensitivity'][1]}%\n"
+            f"- Specificity {test['specificity'][0]}% ± {test['specificity'][1]}%\n\n"
             f"n = {test['n']} held-out patients, {test['positives']} biopsy-positive. "
             f"Wide standard deviations reflect approximately 2 positives per 5-fold chunk."
         )
 
-    st.subheader("Honest limitations")
+    st.subheader("Limitations")
     st.markdown(
-        "- **Small training cohort** (n = 858 from a single Venezuelan clinic). "
+        "- Small training cohort (n = 858 from a single Venezuelan clinic). "
         "Geographic generalization is not validated.\n"
-        "- **The deployed model is `triage + xgb`**, a referral decision-support "
+        "- The deployed model is `triage + xgb`, a referral decision-support "
         "tool that assumes prior screening tests exist (Hinselmann, Schiller, "
         "cytology). It is not a primary screening tool.\n"
-        "- **The host PRS is `BIOLOGICALLY_INFORMED_SYNTHETIC`**: real GWAS "
+        "- The host PRS is `BIOLOGICALLY_INFORMED_SYNTHETIC`: real GWAS "
         "biology, but per-individual genotypes are sampled from population "
         "allele frequencies, not from real VCFs.\n"
-        "- **Augmentation did not improve over UCI-only features** on this "
-        "cohort, reported honestly because the architecture is the "
-        "deliverable, not the metric."
+        "- Augmentation did not improve over UCI-only features on this cohort."
     )
 
     st.subheader("Source")
     st.markdown("- GitHub: https://github.com/nibrasissa/cervirisk-mm")
-    st.markdown("- License: MIT")
 
 st.divider()
 st.caption(
