@@ -210,6 +210,36 @@ def compute_psi(observed: dict, expected: dict, epsilon: float = 1e-6) -> float:
     return psi
 
 
+def compute_psi_per_strain(
+    observed: dict, expected: dict, epsilon: float = 1e-6
+) -> list[dict]:
+    """Return per-strain contributions to total PSI, sorted by magnitude.
+
+    Each strain's contribution is (p_obs - p_exp) * log(p_obs / p_exp),
+    which is always non-negative. The sum across strains equals total PSI.
+    Direction ("over" / "under") indicates whether the strain is over- or
+    under-represented in observed vs expected.
+    """
+    keys = set(observed) | set(expected)
+    total = sum(observed.values()) or 1
+    rows = []
+    for k in keys:
+        p_obs = observed.get(k, 0) / total
+        p_exp = expected.get(k, 0)
+        p_obs_safe = max(p_obs, epsilon)
+        p_exp_safe = max(p_exp, epsilon)
+        contribution = (p_obs_safe - p_exp_safe) * math.log(p_obs_safe / p_exp_safe)
+        rows.append({
+            "strain":        k,
+            "contribution":  contribution,
+            "direction":     "over" if p_obs > p_exp else "under",
+            "observed_pct":  p_obs * 100,
+            "expected_pct":  p_exp * 100,
+        })
+    rows.sort(key=lambda r: -r["contribution"])
+    return rows
+
+
 def severity_for_psi(psi: float) -> tuple[str, str, str]:
     """Return (severity, recommendation, color)."""
     if psi < 0.10:
@@ -438,6 +468,97 @@ def render_psi_card(psi: float, severity: str, recommendation: str, color: str) 
                          color:var(--text-color);opacity:0.9;">
                 Severity: <b>{severity}</b>. {recommendation}
             </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+
+def render_psi_decomposition(contribs: list[dict]) -> None:
+    """Per-strain contribution to total PSI as ranked horizontal bars.
+
+    Magenta bars: strain is over-represented in NCBI vs the prior.
+    Navy bars: strain is under-represented. The sum of all contributions
+    equals total PSI.
+    """
+    if not contribs:
+        return
+    max_c = max(c["contribution"] for c in contribs) or 1.0
+    total = sum(c["contribution"] for c in contribs)
+    st.markdown("##### Where the drift comes from")
+    st.caption(
+        f"Each strain's contribution to total PSI of **{total:.3f}**. "
+        "Magenta means the strain is over-represented in NCBI vs the "
+        "de Sanjose prior. Navy means under-represented."
+    )
+    for c in contribs:
+        color = BRAND_MAGENTA_BAR if c["direction"] == "over" else BRAND_NAVY_BAR
+        arrow = "↑" if c["direction"] == "over" else "↓"
+        width = c["contribution"] / max_c * 100
+        st.markdown(f"""
+            <div style="display:grid;
+                         grid-template-columns:70px 140px 1fr 90px;
+                         align-items:center;font-family:sans-serif;
+                         font-size:0.9em;padding:5px 0;
+                         border-bottom:1px solid {BRAND_LINE};">
+                <div style="font-weight:500;">{c['strain']}</div>
+                <div style="opacity:0.7;font-size:0.85em;">
+                    NCBI {c['observed_pct']:.1f}% · prior {c['expected_pct']:.1f}%
+                </div>
+                <div style="background:rgba(128,128,128,0.18);height:14px;
+                             border-radius:4px;margin:0 16px;">
+                    <div style="background:{color};height:100%;
+                                 width:{width:.0f}%;border-radius:4px;"></div>
+                </div>
+                <div style="color:{color};text-align:right;font-weight:600;
+                             font-variant-numeric:tabular-nums;">
+                    {arrow} {c['contribution']:.3f}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+
+def render_action_policy(psi: float, severity: str, top_contributor: str | None) -> None:
+    """Structured operational block: action, threshold, current value, next step."""
+    label = {"none": "No action", "minor": "Monitor", "significant": "Retrain"}[severity]
+    color = TIER_COLORS["low"] if severity == "none" else \
+            BRAND_AMBER       if severity == "minor" else BRAND_MAGENTA
+    next_step = {
+        "none":        "Detector continues monitoring on every page load. "
+                       "No human action required.",
+        "minor":       "Watch the largest contributor above. If sustained "
+                       "for &gt;7 days, escalate to retrain.",
+        "significant": "Retrain the model: clone the repo, run "
+                       "<code>.\\run.ps1 fit</code> (approx. 12 min) on the "
+                       "latest data, redeploy via "
+                       "<code>git tag v0.2.0 &amp;&amp; git push origin v0.2.0</code>.",
+    }[severity]
+    driver_line = (
+        f"<tr><td style='opacity:0.7;padding:3px 14px 3px 0;'>Largest driver</td>"
+        f"<td><b>{top_contributor}</b></td></tr>"
+        if top_contributor else ""
+    )
+    st.markdown(f"""
+        <div style="border:1px solid {BRAND_LINE};border-left:6px solid {color};
+                     border-radius:4px;padding:14px 18px;margin:14px 0 8px 0;
+                     font-family:sans-serif;">
+            <div style="font-size:0.8em;letter-spacing:0.12em;opacity:0.75;">
+                RECOMMENDED ACTION
+            </div>
+            <div style="font-size:1.6em;font-weight:600;color:{color};margin-top:2px;">
+                {label}
+            </div>
+            <table style="margin-top:10px;border-collapse:collapse;width:100%;
+                           font-size:0.9em;">
+                <tr><td style="opacity:0.7;padding:3px 14px 3px 0;">Trigger</td>
+                    <td>PSI &ge; 0.20 sustained, or PSI &ge; 0.10 with a single
+                        strain driver above 70% of total contribution</td></tr>
+                <tr><td style="opacity:0.7;padding:3px 14px 3px 0;">Current PSI</td>
+                    <td><b>{psi:.3f}</b> ({severity})</td></tr>
+                {driver_line}
+                <tr><td style="opacity:0.7;padding:3px 14px 3px 0;">Next step</td>
+                    <td>{next_step}</td></tr>
+                <tr><td style="opacity:0.7;padding:3px 14px 3px 0;">Owner</td>
+                    <td>nabras.almahrami@ochs.edu.om</td></tr>
+            </table>
         </div>
     """, unsafe_allow_html=True)
 
@@ -698,10 +819,12 @@ with tab_drift:
 
         render_psi_card(psi, severity, recommendation, color)
 
-        with st.expander("Fetch metadata"):
-            st.json(meta)
+        # Per-strain decomposition: where is the drift coming from?
+        contribs = compute_psi_per_strain(counts, DE_SANJOSE_2010_PRIOR)
+        render_psi_decomposition(contribs)
 
-        st.markdown("##### Interpretation")
+        # Why is it happening?
+        st.markdown("##### Why is it happening")
         if severity == "significant":
             st.markdown(
                 "The deposit composition deviates significantly from the "
@@ -724,6 +847,18 @@ with tab_drift:
                 "No meaningful drift. The current NCBI deposit composition "
                 "is consistent with the de Sanjose 2010 prior."
             )
+
+        # What to do about it: structured operational block
+        top_contrib = contribs[0] if contribs else None
+        top_label = (
+            f"{top_contrib['strain']} ({top_contrib['direction']}-represented, "
+            f"+{top_contrib['contribution']:.3f} to PSI)"
+            if top_contrib else None
+        )
+        render_action_policy(psi, severity, top_label)
+
+        with st.expander("Fetch metadata"):
+            st.json(meta)
     else:
         st.info(
             "No NCBI records typed yet. The fetch may still be retrying; "
