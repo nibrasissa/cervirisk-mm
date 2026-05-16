@@ -9,7 +9,7 @@
 [![Tests](https://github.com/nibrasissa/cervirisk-mm/actions/workflows/tests.yml/badge.svg)](https://github.com/nibrasissa/cervirisk-mm/actions/workflows/tests.yml)
 [![Docker](https://github.com/nibrasissa/cervirisk-mm/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/nibrasissa/cervirisk-mm/actions/workflows/docker-publish.yml)
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org)
-
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ---
 
@@ -84,6 +84,103 @@ cd cervirisk-mm
 ```
 
 The integrity contract: **biopsy outcomes are never overwritten by augmentation**. Every value carries a `data_status` tag, one of `REAL_OBSERVED`, `REAL_COMPUTED`, or `SAMPLED_FROM_PRIOR`. Enforced in `src/storage/provenance.py` and tested by `tests/test_ingestion_smoke.py`.
+
+---
+
+## Pipeline stages
+
+The five canonical ML pipeline stages, with the responsible module and what each one produces.
+
+### 1. Data ingestion
+`src/ingestion/` (one loader per source: `uci.py`, `ncbi.py`, `genomes_1kg.py`, `pgs.py`)
+
+Each loader is independent and writes a tagged parquet to `data/raw/`. Loaders fail independently: if NCBI is down, UCI ingestion still completes. The orchestrator (`python -m src.ingestion`) runs all four and reports per-source status. Live NCBI fetches go through `src/ingestion/ncbi_live.py` with retry and graceful failure.
+
+### 2. Preprocessing
+Inside the deployed sklearn Pipeline (`src/model/train.py:build_preprocessor()`)
+
+A `ColumnTransformer` applies `SimpleImputer(strategy='median')` to numeric features and `OneHotEncoder(handle_unknown='ignore')` to categoricals. The preprocessor is part of the saved model artifact, so the exact same transformations apply at training time, evaluation time, and serving time. Missing fields at inference are imputed transparently.
+
+### 3. Feature engineering
+`src/features/` (`build_patient.py`, `host_prs.py`, `strain.py`)
+
+Multi-modal assembly that joins UCI outcomes with HPV strain assignment from NCBI prevalence priors, polygenic risk scores computed from eleven published cervical-cancer GWAS variants and 1000 Genomes allele frequencies, and ancestry tagging. Produces `data/processed/patients_assembled.parquet`. Every column carries a provenance tag. Three feature modes are exposed: `uci_only`, `augmented`, `triage`.
+
+### 4. Model training
+`src/model/train.py`
+
+Trains 18 variants (3 feature modes by 6 algorithms) under a nested protocol: stratified 80/20 split locked at `random_state=42`, LOOCV on DEV with optional inner 3-fold hyperparameter search, 5-fold stability evaluation on a held-out TEST set. Test data never participates in any model fit, asserted per fold by `assert_no_leakage()`. Outputs `models/cervirisk_mm_v0.1.pkl`, `models/metrics.json`, and `models/tuned_params.json`.
+
+### 5. Inference
+`src/api/main.py` plus `src/model/predict.py`
+
+Pydantic schema validates incoming patient records (all fields optional; missing values are imputed by the deployed preprocessor). A single forward pass through the loaded pipeline returns: probability, tier, audit (multi-modal context), and SHAP feature attribution via XGBoost's built-in TreeSHAP. The same code path serves both the FastAPI `/predict/cervical-risk` endpoint and the Streamlit cloud demo at https://cervirisk-mm.streamlit.app/.
+
+---
+
+## Code structure
+
+The codebase is organized **by pipeline layer**, not by file type. Each layer is its own subpackage under `src/`, reads only from upstream layers' artifacts, and writes to its own artifact location.
+
+```
+src/
+├── ingestion/       fetches raw public data        → data/raw/*.parquet
+├── features/        assembles patient table        → data/processed/*.parquet
+├── model/           trains, evaluates, predicts    → models/*.pkl + *.json
+├── api/             exposes model and drift endpoints
+├── drift/           PSI/KS/chi-square detector
+└── storage/         provenance + path helpers (cross-cutting)
+
+tests/               mirrors src/ structure: test_ingestion_smoke.py,
+                     test_no_leakage.py, test_api.py, test_drift.py, etc.
+
+frontend/            Streamlit clinical decision-support UI (calls API over HTTP)
+scripts/             operational scripts (status, demo, predict)
+configs/             runtime configuration
+docs/                data provenance + design notes
+data/                raw and processed parquets (git-ignored, regenerable)
+models/              trained artifacts (committed for the live demo)
+```
+
+The layering principle is **one-way data flow**: each layer can only depend on layers below it. No cyclic imports. Adding a new data source does not touch the model layer; adding a new algorithm does not touch ingestion. This is what makes "drop in real VCFs for synthetic genotypes" (Day 10 on the roadmap) a one-line change instead of a refactor.
+
+Tests live in `tests/` with one test file per source module. Finding the tests for any module is one-step navigation: `src/drift/detector.py` ↔ `tests/test_drift.py`.
+
+The runner script (`run.ps1`) groups operations by intent: `ingest`, `assemble`, `fit`, `train`, `serve`, `ui`, `drift`, `test`, `status`, `quickstart`. Each command is one verb mapped to one or two `python -m` invocations, so the entire pipeline can be reproduced or inspected with self-documenting commands.
+
+---
+
+## Storage decisions
+
+Storage choices follow the principle: **flat files until a database is genuinely necessary**. n = 858 patients, ~10 MB total artifact set, fully reproducible from public sources. A database would add operational complexity (deploy, backup, schema migrations) without measurable benefit at this scale.
+
+| Stage | Storage | Format | Why this choice |
+|---|---|---|---|
+| Raw ingestion | flat file | Parquet | Columnar, fast read for tabular data, native pandas roundtrip, smaller than CSV |
+| Processed patient table | flat file | Parquet | Same reasons. Reproducible from raw with one command |
+| Model artifact | flat file | joblib pickle | sklearn-native serialization with full pipeline state. Versioned (`v0.1`) |
+| Metrics and tuned params | flat file | JSON | Human-readable, git-diffable, accessible from any language |
+| Drift baseline | flat file | JSON | Same. Loaded at API startup, served from `/drift/baseline` |
+| Live NCBI cache | in-memory | Python dict | 5-minute TTL, ephemeral per process. No persistence needed |
+| Reports and metric tables | flat file | Markdown | Human-readable, renders in GitHub, version-controlled |
+
+### When this project would move to a database
+
+Three triggers, in order of likelihood:
+
+1. **Patient registry integration.** When ingesting from a hospital registry (Day 9 on the roadmap), records arrive incrementally and need referential integrity. Postgres with row-level versioning.
+2. **Prediction logging.** Once predictions support real care decisions, every request needs an immutable audit log. SQLite or Postgres with append-only tables, indexed by patient ID and timestamp.
+3. **Drift history.** When drift checks run on a schedule rather than on demand, we need time-series storage. Postgres with a `drift_check` table indexed by timestamp and feature.
+
+Until any of these three exist, flat files are the right choice and the project is more maintainable for it.
+
+### Why Parquet and not CSV?
+
+For the tabular artifacts: Parquet is roughly 5x smaller, 10x faster to read, preserves dtypes including dates and categoricals, and supports column-pruned reads. The only CSV input is the UCI download itself, which is converted to Parquet at ingestion time.
+
+### Why JSON and not YAML for configuration?
+
+For metrics, baselines, and tuned hyperparameters: JSON is unambiguous (no implicit type coercion), every language reads it, it diffs cleanly in git, and `pandas` / `Pydantic` parse it natively. YAML's quoting rules would be a recurring source of bugs for the kinds of mixed numeric and string data these files contain.
 
 ---
 
@@ -217,7 +314,7 @@ CI runs on every push; see the badge at the top.
 - de Sanjose HPV prevalence prior: *Lancet Oncology* 11(11):1048 (2010).
 - Drolet 2019 vaccine impact: *Lancet* 394:497 (2019). Source for drift simulation parameters.
 
-CerviRisk-MM code: Not yet (see `LICENSE`).
+CerviRisk-MM code: MIT (see `LICENSE`).
 
 ---
 
